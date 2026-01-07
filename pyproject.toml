@@ -25,16 +25,17 @@ classifiers = [
 ]
 
 dependencies = [
-    "click>=8.1.0",
-    "loguru>=0.7.0",
-    "rich>=13.0.0",
-    "rich-click>=1.7.0",
+    "click>=8.3.1",
+    "loguru>=0.7.3",
+    "questionary>=2.1.1",
+    "rich>=14.2.0",
+    "rich-click>=1.9.5",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
+    "ruff>=0.14.10",
+    "pyright>=1.1.407",
 ]
 
 [project.scripts]
@@ -60,7 +61,7 @@ target-version = "py310"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_ignores = true
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
