@@ -60,6 +60,24 @@ def is_interactive() -> bool:
     return _interactive and sys.stdout.isatty()
 
 
+def is_on_battery() -> bool:
+    """Check if the Mac is running on battery power."""
+    try:
+        result = subprocess.run(
+            ["pmset", "-g", "batt"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            # Output contains "Now drawing from 'Battery Power'" or "Now drawing from 'AC Power'"
+            return "Battery Power" in result.stdout
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # If pmset not available (non-macOS), assume plugged in
+        return False
+
+
 def load_jobs() -> dict:
     """Load saved job configurations."""
     if not JOBS_FILE.exists():
@@ -1258,11 +1276,11 @@ PLIST_TEMPLATE = """\
         <string>--auto</string>{mode_args}
     </array>
 
-    <!-- Run every {interval_seconds} seconds -->
+    <!-- Check hourly; backup logic decides if backup is actually needed -->
     <key>StartInterval</key>
     <integer>{interval_seconds}</integer>
 
-    <!-- Also run on login/wake to catch up -->
+    <!-- Also run on login/wake to catch up if needed -->
     <key>RunAtLoad</key>
     <true/>
 
@@ -1454,6 +1472,11 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
         if auto:
             ctx.exit(0)
         ctx.exit(1)
+
+    # Skip backup if on battery power (auto mode only - save energy)
+    if auto and is_on_battery():
+        logger.info("Skipping backup: running on battery power")
+        ctx.exit(0)
 
     # List mode
     if list_mode:
@@ -1656,8 +1679,8 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
     # Find snapback executable
     snapback_path = find_snapback_path()
 
-    # Calculate interval in seconds
-    interval_seconds = restic_interval * 3600
+    # Run hourly - the backup logic will skip if not needed based on restic_interval/full_interval
+    interval_seconds = 3600
 
     # Build mode args for plist
     if mode == "hybrid":
@@ -1697,13 +1720,13 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
         raise click.ClickException(f"Failed to load daemon: {result.stderr}")
 
     logger.success(f"Daemon '{name}' installed and running")
+    logger.info("  Checks: every hour (and on login/wake)")
     if mode == "hybrid":
-        logger.info(f"  Mode: hybrid (restic every {restic_interval}h + 7z every {full_interval}d)")
+        logger.info(f"  Mode: hybrid (restic if >{restic_interval}h old, 7z if >{full_interval}d old)")
     elif mode == "restic":
-        logger.info(f"  Mode: restic only (every {restic_interval}h)")
+        logger.info(f"  Mode: restic (if >{restic_interval}h since last backup)")
     else:
-        logger.info(f"  Mode: 7z only (every {restic_interval}h)")
-    logger.info("  Also runs on login/wake")
+        logger.info(f"  Mode: 7z (if >{restic_interval}h since last backup)")
     logger.info(f"  Logs: {log_path}")
     logger.info(f"  Plist: {plist_path}")
 
@@ -1795,8 +1818,11 @@ def daemon_status(name):
             content = plist_path.read_text()
             interval_match = re.search(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>", content)
             if interval_match:
-                interval_hours = int(interval_match.group(1)) // 3600
-                logger.info(f"  Interval: {interval_hours}h")
+                interval_seconds = int(interval_match.group(1))
+                if interval_seconds == 3600:
+                    logger.info("  Checks: every hour")
+                else:
+                    logger.info(f"  Checks: every {interval_seconds // 3600}h")
         except Exception:
             pass
 
