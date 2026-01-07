@@ -24,13 +24,32 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import click
+import rich_click as click
 from loguru import logger
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+
+# Rich-click configuration
+click.rich_click.USE_RICH_MARKUP = True
+click.rich_click.USE_MARKDOWN = True
+click.rich_click.SHOW_ARGUMENTS = True
+click.rich_click.GROUP_ARGUMENTS_OPTIONS = True
+
+# Console for rich output (only used in TTY mode)
+console = Console()
 
 __version__ = "0.1.0"
 
 # Global flag for notifications
 _notify_enabled = False
+
+# Global flag for interactive mode (TTY)
+_interactive = False
+
+
+def is_interactive() -> bool:
+    """Check if we're running in an interactive terminal."""
+    return _interactive and sys.stdout.isatty()
 
 # Default directories to exclude
 DEFAULT_EXCLUDES = [
@@ -360,10 +379,32 @@ def create_restic_backup(dry_run: bool = False) -> bool:
     if dry_run:
         cmd.append("--dry-run")
 
+    env = {**os.environ, "RESTIC_PASSWORD_FILE": str(_config.restic_password_file)}
+
     try:
+        # In interactive mode, let restic show its native progress
+        if is_interactive() and not dry_run:
+            result = subprocess.run(cmd, env=env, timeout=600)
+            if result.returncode != 0:
+                logger.error("Restic backup failed")
+                send_notification(
+                    f"Snapback: {_config.name} Failed",
+                    "Restic backup error",
+                    sound=True,
+                )
+                return False
+            logger.success("Restic backup complete")
+            send_notification(
+                f"Snapback: {_config.name} Complete",
+                "Incremental backup saved",
+                sound=False,
+            )
+            return True
+
+        # Non-interactive: capture output for logging
         result = subprocess.run(
             cmd,
-            env={**os.environ, "RESTIC_PASSWORD_FILE": str(_config.restic_password_file)},
+            env=env,
             capture_output=True,
             text=True,
             timeout=600,
@@ -520,13 +561,24 @@ def create_backup(dry_run: bool = False) -> Path | None:
         env = os.environ.copy()
         env["GZIP"] = "-9"
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=600,
-        )
+        # In interactive mode, show a progress spinner
+        if is_interactive():
+            with console.status(f"[bold blue]Compressing {_config.source_dir.name}...", spinner="dots"):
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=600,
+                )
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600,
+            )
 
         if result.returncode != 0:
             logger.error(f"Backup failed: {result.stderr}")
@@ -780,6 +832,10 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     # Enable notifications
     global _notify_enabled
     _notify_enabled = notify or auto
+
+    # Enable interactive mode (Rich progress) when running manually with a TTY
+    global _interactive
+    _interactive = not auto and sys.stdout.isatty()
 
     # Validate source exists
     if not _config.source_dir.exists():
