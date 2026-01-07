@@ -48,10 +48,16 @@ apt install restic
 
 ## Quick Start
 
-### Basic tar.gz backup
+### Basic backup (7z with 50MB splits, default)
 
 ```bash
 snapback --source ~/projects/myapp --dest ~/Backups --name myapp
+```
+
+### Single-file backup (no splitting)
+
+```bash
+snapback --source ~/projects/myapp --dest ~/Backups --name myapp --no-split
 ```
 
 ### Incremental backup with restic
@@ -62,7 +68,7 @@ snapback --source ~/projects/myapp --dest ~/Backups --name myapp --restic
 
 ### Hybrid mode (recommended for automated backups)
 
-Runs restic every 4 hours and creates a full tar.gz backup weekly:
+Runs restic every 4 hours and creates a full 7z backup weekly:
 
 ```bash
 snapback --source ~/projects/myapp --dest ~/Backups --name myapp --hybrid --auto
@@ -78,9 +84,14 @@ Required arguments:
   --dest, -d PATH      Destination directory for backups
   --name, -N NAME      Name for this backup (used in filenames)
 
+Backup formats:
+  --7z/--tar-gz        Use 7z (default) or tar.gz format
+  --split-size SIZE    Split into volumes (default: 50m)
+  --no-split           Don't split backup into volumes
+
 Backup modes:
   --restic             Use restic incremental backup
-  --hybrid             Hybrid: restic every 4h + tar.gz weekly
+  --hybrid             Hybrid: restic every 4h + full backup weekly
 
 Options:
   --force, -f          Skip recency check and create backup
@@ -93,8 +104,12 @@ Options:
 Exclusions:
   --exclude, -e DIR    Additional directories to exclude
   --no-default-excludes  Don't exclude defaults (node_modules, etc.)
-  --include-git        Include .git in tar.gz (excluded by default)
+  --include-git        Include .git in full backups (excluded by default)
   --exclude-git-restic Exclude .git from restic (included by default)
+
+Job Management:
+  jobs                 List saved job configurations
+  job-remove SOURCE    Remove a saved job configuration
 ```
 
 ## Examples
@@ -124,11 +139,29 @@ snapback \
 ### List existing backups
 
 ```bash
-# List tar.gz backups
+# List full backups
 snapback --source ~/projects/myapp --dest ~/Backups --name myapp --list
 
 # List restic snapshots
 snapback --source ~/projects/myapp --dest ~/Backups --name myapp --list --restic
+```
+
+### Saved job configurations
+
+After a successful backup, your configuration is saved to `~/.config/snapback/jobs.json`. This lets you run future backups with just the source path:
+
+```bash
+# First run: full config required
+snapback --source ~/projects/myapp --dest ~/Backups --name myapp --hybrid
+
+# Subsequent runs: just use --source
+snapback --source ~/projects/myapp
+
+# List all saved jobs
+snapback jobs
+
+# Remove a saved job
+snapback job-remove ~/projects/myapp
 ```
 
 ## macOS Daemon Setup
@@ -211,6 +244,16 @@ The `--hybrid` flag provides a good balance:
 
 ## Restoring from Backup
 
+### From 7z (default format)
+
+```bash
+# Extract to current directory (handles split volumes automatically)
+7z x myapp_2024-01-15_120000.7z.001
+
+# Extract to specific location
+7z x myapp_2024-01-15_120000.7z.001 -o/path/to/restore
+```
+
 ### From tar.gz
 
 ```bash
@@ -261,14 +304,17 @@ Use `--no-default-excludes` to include these, or `--exclude` to add more.
 Backups are named with timestamps for easy identification:
 
 ```
-myapp_2024-01-15_120000.tar.gz    # Full backup from Jan 15 at noon
+myapp_2024-01-15_120000.7z.001    # First volume of 7z backup from Jan 15 at noon
+myapp_2024-01-15_120000.7z.002    # Second volume (if backup is larger than split size)
+myapp_2024-01-15_120000.tar.gz    # tar.gz backup (if using --tar-gz)
 myapp_restic/                      # Restic repository with incremental snapshots
 ```
 
 ## Requirements
 
 - Python 3.10+
-- `tar` and `gzip` (included on macOS/Linux)
+- `7z` (p7zip) for default backup format: `brew install p7zip`
+- `tar` and `gzip` (included on macOS/Linux, for --tar-gz format)
 - `restic` (optional, for incremental backups)
 - `osascript` (optional, for macOS notifications)
 
