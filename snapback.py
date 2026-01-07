@@ -334,9 +334,6 @@ def list_restic_backups() -> None:
 def create_restic_backup(dry_run: bool = False) -> bool:
     """Create a restic incremental backup."""
     assert _config is not None
-    if dry_run:
-        logger.info("[DRY RUN] Would create restic backup")
-        return True
 
     if not ensure_restic_password():
         return False
@@ -348,7 +345,7 @@ def create_restic_backup(dry_run: bool = False) -> bool:
     for d in _config.excludes_for_restic:
         exclude_args.extend(["--exclude", d])
 
-    logger.info("Creating restic backup...")
+    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Creating restic backup...")
     logger.info(f"  Source: {_config.source_dir}")
     logger.debug(f"  Excluding: {', '.join(_config.excludes_for_restic)}")
 
@@ -359,6 +356,9 @@ def create_restic_backup(dry_run: bool = False) -> bool:
         *exclude_args,
         "--tag", _config.name,
     ]
+
+    if dry_run:
+        cmd.append("--dry-run")
 
     try:
         result = subprocess.run(
@@ -371,19 +371,26 @@ def create_restic_backup(dry_run: bool = False) -> bool:
 
         if result.returncode != 0:
             logger.error(f"Restic backup failed: {result.stderr}")
-            send_notification(
-                f"Snapback: {_config.name} Failed",
-                f"Restic error: {result.stderr[:100]}",
-                sound=True,
-            )
+            if not dry_run:
+                send_notification(
+                    f"Snapback: {_config.name} Failed",
+                    f"Restic error: {result.stderr[:100]}",
+                    sound=True,
+                )
             return False
 
-        output = result.stderr
-        logger.success("Restic backup complete")
+        # Combine stdout and stderr for stats
+        output = result.stdout + result.stderr
+        if dry_run:
+            logger.success("[DRY RUN] Restic backup would succeed")
+        else:
+            logger.success("Restic backup complete")
 
+        # Show stats from restic output
         for line in output.split("\n"):
-            if "Added to the repository:" in line or "processed" in line.lower():
-                logger.info(f"  {line.strip()}")
+            line = line.strip()
+            if any(x in line.lower() for x in ["files:", "dirs:", "added", "processed", "would add"]):
+                logger.info(f"  {line}")
 
         send_notification(
             f"Snapback: {_config.name} Complete",
@@ -428,6 +435,46 @@ def list_backups() -> None:
     logger.info(f"Total size: {format_size(total_size)}")
 
 
+def get_backup_stats() -> tuple[int, int]:
+    """Get file count and total size for backup (respecting exclusions)."""
+    assert _config is not None
+
+    # Build find command with exclusions
+    exclude_args = []
+    for d in _config.excludes_for_full:
+        if "*" in d:
+            # Pattern like *.egg-info
+            exclude_args.extend(["-name", d, "-prune", "-o"])
+        else:
+            # Directory name
+            exclude_args.extend(["-name", d, "-prune", "-o"])
+
+    # Use find to list files, excluding specified dirs
+    cmd = ["find", str(_config.source_dir)]
+    cmd.extend(exclude_args)
+    cmd.extend(["-type", "f", "-print"])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return 0, 0
+
+        files = [f for f in result.stdout.strip().split("\n") if f]
+        file_count = len(files)
+
+        # Sum file sizes
+        total_size = 0
+        for f in files:
+            try:
+                total_size += Path(f).stat().st_size
+            except (OSError, FileNotFoundError):
+                pass
+
+        return file_count, total_size
+    except Exception:
+        return 0, 0
+
+
 def create_backup(dry_run: bool = False) -> Path | None:
     """Create a compressed backup."""
     assert _config is not None
@@ -451,7 +498,18 @@ def create_backup(dry_run: bool = False) -> Path | None:
 
     if dry_run:
         logger.info(f"[DRY RUN] Would create backup: {backup_name}")
-        logger.debug(f"[DRY RUN] Command: {' '.join(cmd)}")
+        logger.info(f"  Source: {_config.source_dir}")
+        logger.info(f"  Excluding: {', '.join(_config.excludes_for_full)}")
+
+        # Get stats
+        file_count, total_size = get_backup_stats()
+        if file_count > 0:
+            # Estimate compressed size (typically 30-50% of original for code)
+            estimated_compressed = int(total_size * 0.4)
+            logger.info(f"  Files: {file_count:,}")
+            logger.info(f"  Uncompressed: {format_size(total_size)}")
+            logger.info(f"  Estimated compressed: ~{format_size(estimated_compressed)}")
+
         return None
 
     logger.info(f"Creating backup: {backup_name}")
