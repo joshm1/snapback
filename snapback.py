@@ -1679,7 +1679,7 @@ def find_snapback_path() -> str:
 @click.option("--dest", "-d", type=click.Path(path_type=Path), help="Destination directory for backups")
 @click.option("--name", "-N", help="Name for this backup (used in filenames)")
 @click.option("--restic", is_flag=True, help="Use restic incremental backup")
-@click.option("--hybrid", is_flag=True, help="Hybrid mode: restic + full tar.gz")
+@click.option("--hybrid", is_flag=True, help="Hybrid mode: restic incremental + periodic 7z full backup")
 @click.option("--exclude", "-e", multiple=True, help="Additional directories to exclude")
 @click.option("--no-default-excludes", is_flag=True, help="Don't use default exclusions")
 @click.option("--include-git", is_flag=True, help="Include .git in tar.gz backups")
@@ -2016,10 +2016,10 @@ class EditJobModal(ModalScreen):
             yield Label("Format:")
             with RadioSet(id="format-radio"):
                 current_format = resolved.get("format", "7z")
-                yield RadioButton("tar.gz", value=current_format == "tar.gz")
-                yield RadioButton("7z", value=current_format == "7z")
-                yield RadioButton("restic", value=current_format == "restic")
-                yield RadioButton("hybrid", value=current_format == "hybrid")
+                yield RadioButton("tar.gz (archive)", value=current_format == "tar.gz")
+                yield RadioButton("7z (compressed archive)", value=current_format == "7z")
+                yield RadioButton("restic (incremental)", value=current_format == "restic")
+                yield RadioButton("hybrid (restic + 7z)", value=current_format == "hybrid")
 
             yield Label("1Password Vault (optional):")
             yield Input(value=self.job.get("op_vault", ""), id="op-vault-input", placeholder="Vault name")
@@ -2107,10 +2107,10 @@ class EditDefaultsModal(ModalScreen):
             yield Label("Default Format:")
             with RadioSet(id="format-radio"):
                 current_format = self.defaults.get("format", "7z")
-                yield RadioButton("tar.gz", value=current_format == "tar.gz")
-                yield RadioButton("7z", value=current_format == "7z")
-                yield RadioButton("restic", value=current_format == "restic")
-                yield RadioButton("hybrid", value=current_format == "hybrid")
+                yield RadioButton("tar.gz (archive)", value=current_format == "tar.gz")
+                yield RadioButton("7z (compressed archive)", value=current_format == "7z")
+                yield RadioButton("restic (incremental)", value=current_format == "restic")
+                yield RadioButton("hybrid (restic + 7z)", value=current_format == "hybrid")
 
             yield Label("Restic Interval (hours):")
             yield Input(value=str(self.defaults.get("restic_interval_hours", 4)), id="restic-interval-input")
