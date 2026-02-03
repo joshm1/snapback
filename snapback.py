@@ -36,7 +36,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet, Static
 
 # Rich-click configuration
 click.rich_click.USE_RICH_MARKUP = True
@@ -109,14 +109,19 @@ def load_jobs() -> dict:
         # Merge in state data for backward compatibility
         job_state = state.get(key, {})
 
+        archive_format = resolved.get("archive_format", "")
+        use_restic = resolved.get("use_restic", False)
+
         jobs[key] = {
             "source": source,
             "dest": resolved.get("dest", ""),
             "name": resolved.get("name", ""),
             "options": {
-                "use_7z": resolved.get("format") == "7z",
-                "use_restic": resolved.get("format") == "restic",
-                "hybrid": resolved.get("format") == "hybrid",
+                "archive_format": archive_format,
+                "use_7z": archive_format == "7z",
+                "use_tar_gz": archive_format == "tar.gz",
+                "use_restic": use_restic,
+                "hybrid": use_restic and archive_format != "",  # backward compat
                 "op_vault": resolved.get("op_vault"),
                 "restic_interval_hours": resolved.get("restic_interval_hours"),
                 "full_interval_days": resolved.get("full_interval_days"),
@@ -145,13 +150,17 @@ def save_jobs(jobs: dict) -> None:
             job_config["dest"] = dest
 
         opts = job_data.get("options", {})
-        if opts.get("hybrid"):
-            job_config["format"] = "hybrid"
-        elif opts.get("use_restic"):
-            job_config["format"] = "restic"
-        elif not opts.get("use_7z", True):
-            job_config["format"] = "tar.gz"
-        # else: inherits default
+
+        # New format fields
+        if "archive_format" in opts:
+            job_config["archive_format"] = opts["archive_format"]
+        elif opts.get("use_7z"):
+            job_config["archive_format"] = "7z"
+        elif opts.get("use_tar_gz"):
+            job_config["archive_format"] = "tar.gz"
+
+        if opts.get("use_restic"):
+            job_config["use_restic"] = True
 
         if opts.get("op_vault"):
             job_config["op_vault"] = opts["op_vault"]
@@ -180,7 +189,8 @@ def get_job_key(source: Path) -> str:
 DEFAULT_MANIFEST: dict = {
     "defaults": {
         "dest": "~/Backups",
-        "format": "7z",
+        "archive_format": "7z",  # "7z", "tar.gz", or "" (disabled)
+        "use_restic": False,
         "restic_interval_hours": 4,
         "full_interval_days": 7,
         "op_vault": "",
@@ -189,12 +199,40 @@ DEFAULT_MANIFEST: dict = {
 }
 
 
+def _migrate_format_field(config: dict) -> dict:
+    """Migrate old 'format' field to 'archive_format' + 'use_restic'."""
+    if "format" not in config:
+        return config
+
+    old_format = config.pop("format")
+    if old_format == "hybrid":
+        config["archive_format"] = "7z"
+        config["use_restic"] = True
+    elif old_format == "restic":
+        config["archive_format"] = ""
+        config["use_restic"] = True
+    elif old_format in ("7z", "tar.gz"):
+        config["archive_format"] = old_format
+        config["use_restic"] = False
+    return config
+
+
 def load_manifest() -> dict:
     """Load manifest configuration."""
     if not MANIFEST_FILE.exists():
         return DEFAULT_MANIFEST.copy()
     try:
-        return tomllib.loads(MANIFEST_FILE.read_text())
+        manifest = tomllib.loads(MANIFEST_FILE.read_text())
+
+        # Migrate old format field in defaults
+        if "defaults" in manifest:
+            manifest["defaults"] = _migrate_format_field(manifest["defaults"])
+
+        # Migrate old format field in each job
+        for job in manifest.get("jobs", []):
+            _migrate_format_field(job)
+
+        return manifest
     except tomllib.TOMLDecodeError:
         logger.warning(f"Failed to parse {MANIFEST_FILE}, using defaults")
         return DEFAULT_MANIFEST.copy()
@@ -2013,13 +2051,16 @@ class EditJobModal(ModalScreen):
             yield Label("Dest:")
             yield Input(value=dest_value, id="dest-input", placeholder=dest_placeholder)
 
-            yield Label("Format:")
-            with RadioSet(id="format-radio"):
-                current_format = resolved.get("format", "7z")
-                yield RadioButton("tar.gz (archive)", value=current_format == "tar.gz")
-                yield RadioButton("7z (compressed archive)", value=current_format == "7z")
-                yield RadioButton("restic (incremental)", value=current_format == "restic")
-                yield RadioButton("hybrid (restic + 7z)", value=current_format == "hybrid")
+            yield Static("─── Full Backups ───")
+            yield Label("Archive Format:")
+            with RadioSet(id="archive-format-radio"):
+                current_archive = resolved.get("archive_format", "7z")
+                yield RadioButton("None", value=current_archive == "")
+                yield RadioButton("7z", value=current_archive == "7z")
+                yield RadioButton("tar.gz", value=current_archive == "tar.gz")
+
+            yield Static("─── Incremental ───")
+            yield Checkbox("Enable restic", value=resolved.get("use_restic", False), id="use-restic-checkbox")
 
             yield Label("1Password Vault (optional):")
             yield Input(value=self.job.get("op_vault", ""), id="op-vault-input", placeholder="Vault name")
@@ -2035,19 +2076,27 @@ class EditJobModal(ModalScreen):
             dest = self.query_one("#dest-input", Input).value.strip()
             op_vault = self.query_one("#op-vault-input", Input).value.strip()
 
-            radio_set = self.query_one("#format-radio", RadioSet)
-            format_map = {0: "tar.gz", 1: "7z", 2: "restic", 3: "hybrid"}
-            format_value = format_map.get(radio_set.pressed_index, "7z")
+            archive_radio = self.query_one("#archive-format-radio", RadioSet)
+            archive_map = {0: "", 1: "7z", 2: "tar.gz"}
+            archive_format = archive_map.get(archive_radio.pressed_index, "7z")
+
+            use_restic = self.query_one("#use-restic-checkbox", Checkbox).value
 
             if not name or not source:
                 self.notify("Name and source are required", severity="error")
                 return
 
+            if not archive_format and not use_restic:
+                self.notify("Must enable at least one backup method", severity="error")
+                return
+
             new_job = {"name": name, "source": source}
             if dest:
                 new_job["dest"] = dest
-            if format_value != self.defaults.get("format", "7z"):
-                new_job["format"] = format_value
+            if archive_format != self.defaults.get("archive_format", "7z"):
+                new_job["archive_format"] = archive_format
+            if use_restic != self.defaults.get("use_restic", False):
+                new_job["use_restic"] = use_restic
             if op_vault:
                 new_job["op_vault"] = op_vault
 
@@ -2104,19 +2153,22 @@ class EditDefaultsModal(ModalScreen):
             yield Label("Default Destination:")
             yield Input(value=self.defaults.get("dest", "~/Backups"), id="dest-input")
 
-            yield Label("Default Format:")
-            with RadioSet(id="format-radio"):
-                current_format = self.defaults.get("format", "7z")
-                yield RadioButton("tar.gz (archive)", value=current_format == "tar.gz")
-                yield RadioButton("7z (compressed archive)", value=current_format == "7z")
-                yield RadioButton("restic (incremental)", value=current_format == "restic")
-                yield RadioButton("hybrid (restic + 7z)", value=current_format == "hybrid")
-
-            yield Label("Restic Interval (hours):")
-            yield Input(value=str(self.defaults.get("restic_interval_hours", 4)), id="restic-interval-input")
+            yield Static("─── Full Backups ───")
+            yield Label("Archive Format:")
+            with RadioSet(id="archive-format-radio"):
+                current_archive = self.defaults.get("archive_format", "7z")
+                yield RadioButton("None", value=current_archive == "")
+                yield RadioButton("7z", value=current_archive == "7z")
+                yield RadioButton("tar.gz", value=current_archive == "tar.gz")
 
             yield Label("Full Backup Interval (days):")
             yield Input(value=str(self.defaults.get("full_interval_days", 7)), id="full-interval-input")
+
+            yield Static("─── Incremental ───")
+            yield Checkbox("Enable restic", value=self.defaults.get("use_restic", False), id="use-restic-checkbox")
+
+            yield Label("Restic Interval (hours):")
+            yield Input(value=str(self.defaults.get("restic_interval_hours", 4)), id="restic-interval-input")
 
             yield Label("1Password Vault (optional):")
             yield Input(value=self.defaults.get("op_vault", ""), id="op-vault-input", placeholder="Vault name for restic passwords")
@@ -2132,9 +2184,11 @@ class EditDefaultsModal(ModalScreen):
             full_interval = self.query_one("#full-interval-input", Input).value.strip()
             op_vault = self.query_one("#op-vault-input", Input).value.strip()
 
-            radio_set = self.query_one("#format-radio", RadioSet)
-            format_map = {0: "tar.gz", 1: "7z", 2: "restic", 3: "hybrid"}
-            format_value = format_map.get(radio_set.pressed_index, "7z")
+            archive_radio = self.query_one("#archive-format-radio", RadioSet)
+            archive_map = {0: "", 1: "7z", 2: "tar.gz"}
+            archive_format = archive_map.get(archive_radio.pressed_index, "7z")
+
+            use_restic = self.query_one("#use-restic-checkbox", Checkbox).value
 
             try:
                 restic_hours = int(restic_interval)
@@ -2145,7 +2199,8 @@ class EditDefaultsModal(ModalScreen):
 
             new_defaults = {
                 "dest": dest or "~/Backups",
-                "format": format_value,
+                "archive_format": archive_format,
+                "use_restic": use_restic,
                 "restic_interval_hours": restic_hours,
                 "full_interval_days": full_days,
                 "op_vault": op_vault,
@@ -2236,11 +2291,23 @@ class SnapbackApp(App):
                 except ValueError:
                     last_run = latest
 
+            # Build format display
+            archive_fmt = resolved.get("archive_format", "")
+            use_restic = resolved.get("use_restic", False)
+            if archive_fmt and use_restic:
+                format_display = f"{archive_fmt}+restic"
+            elif archive_fmt:
+                format_display = archive_fmt
+            elif use_restic:
+                format_display = "restic"
+            else:
+                format_display = "none"
+
             table.add_row(
                 resolved.get("name", ""),
                 source,
                 resolved.get("dest", ""),
-                resolved.get("format", "7z"),
+                format_display,
                 daemon_status,
                 last_run,
             )
