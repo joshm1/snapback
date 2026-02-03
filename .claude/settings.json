@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "ralph-loop@claude-plugins-official": true,
+    "browser-testing@joshm1-claude-plugins": false
+  }
+}
