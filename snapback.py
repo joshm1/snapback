@@ -1910,6 +1910,11 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
 class ConfirmModal(ModalScreen):
     """Modal for confirmation dialogs."""
 
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
     CSS = """
     ConfirmModal {
         align: center middle;
@@ -1950,6 +1955,11 @@ class ConfirmModal(ModalScreen):
 
 class EditJobModal(ModalScreen):
     """Modal for editing a job."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
     CSS = """
     EditJobModal {
@@ -2048,6 +2058,11 @@ class EditJobModal(ModalScreen):
 
 class EditDefaultsModal(ModalScreen):
     """Modal for editing defaults."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
     CSS = """
     EditDefaultsModal {
