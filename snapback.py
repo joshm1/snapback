@@ -105,6 +105,41 @@ def get_job_key(source: Path) -> str:
     return str(source.expanduser().resolve())
 
 
+DEFAULT_MANIFEST: dict = {
+    "defaults": {
+        "dest": "~/Backups",
+        "format": "7z",
+        "restic_interval_hours": 4,
+        "full_interval_days": 7,
+    },
+    "jobs": [],
+}
+
+
+def load_manifest() -> dict:
+    """Load manifest configuration."""
+    if not MANIFEST_FILE.exists():
+        return DEFAULT_MANIFEST.copy()
+    try:
+        return tomllib.loads(MANIFEST_FILE.read_text())
+    except tomllib.TOMLDecodeError:
+        logger.warning(f"Failed to parse {MANIFEST_FILE}, using defaults")
+        return DEFAULT_MANIFEST.copy()
+
+
+def save_manifest(manifest: dict) -> None:
+    """Save manifest configuration."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_FILE.write_text(tomli_w.dumps(manifest))
+
+
+def resolve_job_config(job: dict, defaults: dict) -> dict:
+    """Resolve a job config by applying defaults for missing fields."""
+    resolved = defaults.copy()
+    resolved.update(job)
+    return resolved
+
+
 def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
     """Save configuration for a backup job (merges with existing options)."""
     jobs = load_jobs()
