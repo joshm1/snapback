@@ -183,6 +183,7 @@ DEFAULT_MANIFEST: dict = {
         "format": "7z",
         "restic_interval_hours": 4,
         "full_interval_days": 7,
+        "op_vault": "",
     },
     "jobs": [],
 }
@@ -2102,6 +2103,9 @@ class EditDefaultsModal(ModalScreen):
             yield Label("Full Backup Interval (days):")
             yield Input(value=str(self.defaults.get("full_interval_days", 7)), id="full-interval-input")
 
+            yield Label("1Password Vault (optional):")
+            yield Input(value=self.defaults.get("op_vault", ""), id="op-vault-input", placeholder="Vault name for restic passwords")
+
             with Horizontal(id="defaults-buttons"):
                 yield Button("Save", variant="primary", id="save-btn")
                 yield Button("Cancel", id="cancel-btn")
@@ -2111,6 +2115,7 @@ class EditDefaultsModal(ModalScreen):
             dest = self.query_one("#dest-input", Input).value.strip()
             restic_interval = self.query_one("#restic-interval-input", Input).value.strip()
             full_interval = self.query_one("#full-interval-input", Input).value.strip()
+            op_vault = self.query_one("#op-vault-input", Input).value.strip()
 
             radio_set = self.query_one("#format-radio", RadioSet)
             format_map = {0: "tar.gz", 1: "7z", 2: "restic", 3: "hybrid"}
@@ -2128,6 +2133,7 @@ class EditDefaultsModal(ModalScreen):
                 "format": format_value,
                 "restic_interval_hours": restic_hours,
                 "full_interval_days": full_days,
+                "op_vault": op_vault,
             }
 
             self.dismiss(new_defaults)
