@@ -140,6 +140,39 @@ def resolve_job_config(job: dict, defaults: dict) -> dict:
     return resolved
 
 
+def load_state() -> dict:
+    """Load runtime state."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    """Save runtime state."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+
+def get_job_state(source: Path) -> dict:
+    """Get runtime state for a specific job."""
+    state = load_state()
+    key = get_job_key(source)
+    return state.get(key, {})
+
+
+def update_job_state(source: Path, **updates) -> None:
+    """Update runtime state for a job."""
+    state = load_state()
+    key = get_job_key(source)
+    if key not in state:
+        state[key] = {}
+    state[key].update(updates)
+    save_state(state)
+
+
 def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
     """Save configuration for a backup job (merges with existing options)."""
     jobs = load_jobs()
