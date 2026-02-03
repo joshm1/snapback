@@ -3109,6 +3109,102 @@ def daemon_plist(name, raw):
 # Jobs Management
 # =============================================================================
 
+@cli.command("config")
+def show_config():
+    """Show current configuration with rich formatting."""
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+
+    manifest = load_manifest()
+    state = load_state()
+    defaults = manifest.get("defaults", {})
+
+    # Defaults panel
+    defaults_text = Text()
+    defaults_text.append("Destination: ", style="bold")
+    defaults_text.append(f"{defaults.get('dest', '~/Backups')}\n")
+
+    archive_fmt = defaults.get("archive_format", "7z")
+    use_restic = defaults.get("use_restic", False)
+    defaults_text.append("Archive Format: ", style="bold")
+    defaults_text.append(f"{archive_fmt or 'none'}\n")
+    defaults_text.append("Restic: ", style="bold")
+    defaults_text.append(f"{'enabled' if use_restic else 'disabled'}\n")
+
+    defaults_text.append("Full Backup Interval: ", style="bold")
+    defaults_text.append(f"{defaults.get('full_interval_days', 7)} days\n")
+    defaults_text.append("Restic Interval: ", style="bold")
+    defaults_text.append(f"{defaults.get('restic_interval_hours', 4)} hours\n")
+
+    op_vault = defaults.get("op_vault", "")
+    if op_vault:
+        defaults_text.append("1Password Vault: ", style="bold")
+        defaults_text.append(f"{op_vault}\n")
+
+    console.print(Panel(defaults_text, title="[bold]Defaults[/bold]", border_style="blue"))
+
+    # Jobs table
+    table = Table(title="Jobs", show_header=True, header_style="bold")
+    table.add_column("Name", style="cyan")
+    table.add_column("Source")
+    table.add_column("Dest")
+    table.add_column("Format")
+    table.add_column("Daemon")
+    table.add_column("Last Run")
+
+    for job in manifest.get("jobs", []):
+        resolved = resolve_job_config(job, defaults)
+        source = job.get("source", "")
+        key = get_job_key(Path(source)) if source else ""
+        job_state = state.get(key, {})
+
+        # Format display
+        archive_fmt = resolved.get("archive_format", "")
+        use_restic = resolved.get("use_restic", False)
+        if archive_fmt and use_restic:
+            format_display = f"{archive_fmt}+restic"
+        elif archive_fmt:
+            format_display = archive_fmt
+        elif use_restic:
+            format_display = "restic"
+        else:
+            format_display = "none"
+
+        # Daemon status
+        daemon_plist = job_state.get("daemon_plist", "")
+        daemon_status = "[green]●[/green]" if daemon_plist and Path(daemon_plist).exists() else "[dim]○[/dim]"
+
+        # Last run
+        last_runs = job_state.get("last_runs", {})
+        last_run = "[dim]never[/dim]"
+        if last_runs:
+            latest = max(last_runs.values())
+            try:
+                dt = datetime.fromisoformat(latest)
+                delta = datetime.now() - dt
+                if delta.days > 0:
+                    last_run = f"{delta.days}d ago"
+                elif delta.seconds >= 3600:
+                    last_run = f"{delta.seconds // 3600}h ago"
+                else:
+                    last_run = f"{delta.seconds // 60}m ago"
+            except ValueError:
+                last_run = latest
+
+        table.add_row(
+            resolved.get("name", ""),
+            source,
+            resolved.get("dest", ""),
+            format_display,
+            daemon_status,
+            last_run,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Config file: {MANIFEST_FILE}[/dim]")
+
+
 @cli.command("jobs")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed info for each job")
 def list_jobs(verbose):
