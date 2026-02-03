@@ -16,6 +16,10 @@ For more info: https://github.com/joshm1/snapback
 """
 
 import json
+import tomllib
+
+import tomli_w
+
 import os
 import secrets
 import subprocess
@@ -43,6 +47,8 @@ __version__ = "0.1.0"
 # Config directory for job metadata
 CONFIG_DIR = Path.home() / ".config" / "snapback"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
+MANIFEST_FILE = CONFIG_DIR / "manifest.toml"
+STATE_FILE = CONFIG_DIR / "state.json"
 
 # Global flag for notifications
 _notify_enabled = False
