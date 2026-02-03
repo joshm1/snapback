@@ -4,7 +4,8 @@ A flexible backup tool that supports both traditional compressed archives (7z/ta
 
 ## Features
 
-- **Hybrid backup mode**: Combine frequent incremental backups (restic) with weekly full backups (7z)
+- **TUI configuration editor**: Interactive terminal UI (`snapback configure`) for managing backup jobs
+- **Combined backup mode**: Combine frequent incremental backups (restic) with weekly full archives (7z)
 - **7z format by default**: Better compression than tar.gz, with automatic 50MB volume splitting
 - **Space efficient**: Restic deduplicates at the block level, typically 40x smaller than full backups over time
 - **Smart scheduling**: Only backup when needed based on configurable time thresholds
@@ -69,12 +70,12 @@ snapback --source ~/projects/myapp --dest ~/Backups --name myapp --no-split
 snapback --source ~/projects/myapp --dest ~/Backups --name myapp --restic
 ```
 
-### Hybrid mode (recommended for automated backups)
+### Combined mode (recommended for automated backups)
 
 Runs restic every 4 hours and creates a full 7z backup weekly:
 
 ```bash
-snapback --source ~/projects/myapp --dest ~/Backups --name myapp --hybrid --auto
+snapback --source ~/projects/myapp --dest ~/Backups --name myapp --restic --archive-format 7z --auto
 ```
 
 ## Usage
@@ -88,13 +89,13 @@ Required arguments:
   --name, -N NAME      Name for this backup (used in filenames)
 
 Backup formats:
-  --7z/--tar-gz        Use 7z (default) or tar.gz format
+  --archive-format FMT Use 7z (default), tar.gz, or none
   --split-size SIZE    Split into volumes (default: 50m)
   --no-split           Don't split backup into volumes
 
 Backup modes:
-  --restic             Use restic incremental backup
-  --hybrid             Hybrid: restic every 4h + full backup weekly
+  --restic/--no-restic Enable/disable restic incremental backup
+  Combined mode:       Use --restic --archive-format 7z for both
 
 Options:
   --force, -f          Skip recency check and create backup
@@ -115,17 +116,50 @@ Exclusions:
   --exclude-git-restic Exclude .git from restic (included by default)
 
 Subcommands:
+  configure            Launch interactive TUI configuration editor
   daemon install       Install as macOS LaunchAgent daemon
   daemon uninstall     Remove daemon
   daemon status        Check daemon status
   daemon logs          View daemon logs
+  check-passwords      Verify restic passwords work with repositories
   jobs                 List saved job configurations
   job-remove SOURCE    Remove a saved job configuration
 ```
 
+## TUI Configuration Editor
+
+The easiest way to manage backup jobs is with the interactive TUI:
+
+```bash
+snapback configure
+```
+
+The TUI provides:
+- **Job management**: Create, edit, and delete backup jobs
+- **Daemon control**: Install/uninstall macOS daemons directly
+- **Run backups**: Execute backups with real-time status indicator
+- **View history**: See restic snapshots and archive files (h key)
+- **View plist**: Inspect daemon configuration (p key)
+- **Edit defaults**: Configure global settings like 1Password vault
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| n | New job |
+| e | Edit selected job |
+| d | Delete selected job |
+| i | Install daemon |
+| u | Uninstall daemon |
+| r | Run backup now |
+| s | Edit defaults |
+| p | View daemon plist |
+| h | View backup history |
+| q | Quit |
+
 ## macOS Daemon Setup
 
-The easiest way to set up automated backups on macOS is with the daemon commands:
+You can also set up daemons via command line:
 
 ### Install daemon (interactive)
 
@@ -137,7 +171,7 @@ snapback daemon install \
 ```
 
 This will interactively prompt you to:
-1. Select backup mode (hybrid, restic-only, or 7z-only)
+1. Select backup mode (restic + 7z, restic-only, or 7z-only)
 2. Optionally backup the restic password to 1Password
 
 ### Install daemon (non-interactive)
@@ -147,7 +181,8 @@ snapback daemon install \
   --source ~/projects/myapp \
   --dest ~/Backups \
   --name myapp \
-  --mode hybrid \
+  --restic \
+  --archive-format 7z \
   --1password \
   --1password-vault "My Vault"
 ```
@@ -159,9 +194,10 @@ daemon install options:
   --source, -s PATH      Source directory to backup (required)
   --dest, -d PATH        Destination directory (required)
   --name, -N NAME        Backup name (required)
-  --mode, -m MODE        Backup mode: hybrid, restic, or 7z (prompts if not specified)
+  --restic/--no-restic   Enable/disable restic incremental backups
+  --archive-format FMT   Archive format: 7z, tar.gz, or none
   --restic-interval N    Min hours between restic backups (default: 4)
-  --full-interval N      Min days between full 7z backups (default: 7)
+  --full-interval N      Min days between full archive backups (default: 7)
   --1password            Backup restic password to 1Password
   --1password-vault      1Password vault name
 ```
@@ -232,7 +268,7 @@ snapback \
   --source ~/projects/my-app \
   --dest "/Users/josh/Library/CloudStorage/GoogleDrive-josh@gmail.com/My Drive/Backups" \
   --name my-app \
-  --hybrid --auto
+  --restic --archive-format 7z --auto
 ```
 
 ### Backup with custom exclusions
@@ -259,11 +295,11 @@ snapback --source ~/projects/myapp --dest ~/Backups --name myapp --list --restic
 
 ### Saved job configurations
 
-After a successful backup, your configuration is saved to `~/.config/snapback/jobs.json`. This lets you run future backups with just the source path:
+After a successful backup, your configuration is saved to `~/.config/snapback/manifest.toml`. This lets you run future backups with just the source path:
 
 ```bash
 # First run: full config required
-snapback --source ~/projects/myapp --dest ~/Backups --name myapp --hybrid
+snapback --source ~/projects/myapp --dest ~/Backups --name myapp --restic --archive-format 7z
 
 # Subsequent runs: just use --source
 snapback --source ~/projects/myapp
@@ -273,13 +309,16 @@ snapback jobs
 
 # Remove a saved job
 snapback job-remove ~/projects/myapp
+
+# Or use the TUI for easier management
+snapback configure
 ```
 
 ## Backup Strategy
 
-### Recommended: Hybrid Mode
+### Recommended: Combined Mode
 
-The `--hybrid` flag (or `--mode hybrid` for daemon) provides a good balance:
+Using `--restic --archive-format 7z` provides a good balance:
 
 - **Restic (every 4 hours)**: Space-efficient incremental backups. Only changed blocks are stored, typically using ~40x less space than full backups over time.
 - **Full 7z (weekly)**: Easy-to-restore complete backup. Just extract the archive - no special tools needed.
