@@ -2452,7 +2452,7 @@ class SnapbackApp(App):
             "--mode", mode,
         ]
         if op_vault:
-            cmd.extend(["--op-vault", op_vault])
+            cmd.extend(["--1password-vault", op_vault])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -2544,7 +2544,7 @@ class SnapbackApp(App):
         # else: defaults to 7z
 
         if job.get("op_vault"):
-            cmd.extend(["--op-vault", job["op_vault"]])
+            cmd.extend(["--1password-vault", job["op_vault"]])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
