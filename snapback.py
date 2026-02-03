@@ -2045,6 +2045,96 @@ class EditJobModal(ModalScreen):
             self.dismiss(None)
 
 
+class EditDefaultsModal(ModalScreen):
+    """Modal for editing defaults."""
+
+    CSS = """
+    EditDefaultsModal {
+        align: center middle;
+    }
+
+    #defaults-dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #defaults-dialog Label {
+        margin-top: 1;
+    }
+
+    #defaults-dialog Input {
+        margin-bottom: 1;
+    }
+
+    #defaults-buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #defaults-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, defaults: dict) -> None:
+        super().__init__()
+        self.defaults = defaults
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="defaults-dialog"):
+            yield Label("Default Destination:")
+            yield Input(value=self.defaults.get("dest", "~/Backups"), id="dest-input")
+
+            yield Label("Default Format:")
+            with RadioSet(id="format-radio"):
+                current_format = self.defaults.get("format", "7z")
+                yield RadioButton("tar.gz", value=current_format == "tar.gz")
+                yield RadioButton("7z", value=current_format == "7z")
+                yield RadioButton("restic", value=current_format == "restic")
+                yield RadioButton("hybrid", value=current_format == "hybrid")
+
+            yield Label("Restic Interval (hours):")
+            yield Input(value=str(self.defaults.get("restic_interval_hours", 4)), id="restic-interval-input")
+
+            yield Label("Full Backup Interval (days):")
+            yield Input(value=str(self.defaults.get("full_interval_days", 7)), id="full-interval-input")
+
+            with Horizontal(id="defaults-buttons"):
+                yield Button("Save", variant="primary", id="save-btn")
+                yield Button("Cancel", id="cancel-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-btn":
+            dest = self.query_one("#dest-input", Input).value.strip()
+            restic_interval = self.query_one("#restic-interval-input", Input).value.strip()
+            full_interval = self.query_one("#full-interval-input", Input).value.strip()
+
+            radio_set = self.query_one("#format-radio", RadioSet)
+            format_map = {0: "tar.gz", 1: "7z", 2: "restic", 3: "hybrid"}
+            format_value = format_map.get(radio_set.pressed_index, "7z")
+
+            try:
+                restic_hours = int(restic_interval)
+                full_days = int(full_interval)
+            except ValueError:
+                self.notify("Intervals must be integers", severity="error")
+                return
+
+            new_defaults = {
+                "dest": dest or "~/Backups",
+                "format": format_value,
+                "restic_interval_hours": restic_hours,
+                "full_interval_days": full_days,
+            }
+
+            self.dismiss(new_defaults)
+        else:
+            self.dismiss(None)
+
+
 class SnapbackApp(App):
     """Textual app for managing snapback jobs."""
 
@@ -2365,7 +2455,19 @@ class SnapbackApp(App):
         self.refresh_jobs()
 
     def action_edit_defaults(self) -> None:
-        self.notify("Edit defaults (not implemented yet)")
+        manifest = load_manifest()
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditDefaultsModal(defaults), self._on_defaults_edited)
+
+    def _on_defaults_edited(self, result: dict | None) -> None:
+        if result is None:
+            return
+
+        manifest = load_manifest()
+        manifest["defaults"] = result
+        save_manifest(manifest)
+        self.refresh_jobs()
+        self.notify("Defaults saved")
 
 
 @cli.group()
