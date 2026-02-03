@@ -2138,6 +2138,9 @@ class EditDefaultsModal(ModalScreen):
 class SnapbackApp(App):
     """Textual app for managing snapback jobs."""
 
+    TITLE = "Snapback"
+    SUB_TITLE = "Backup Configuration"
+
     CSS = """
     Screen {
         align: center middle;
@@ -2171,6 +2174,8 @@ class SnapbackApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
         table.add_columns("NAME", "SOURCE", "DEST", "FORMAT", "DAEMON", "LAST RUN")
         self.refresh_jobs()
 
