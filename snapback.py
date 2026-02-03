@@ -2419,21 +2419,28 @@ class SnapbackApp(App):
 
         # Call the daemon install logic
         try:
-            # Build options
-            use_restic = resolved.get("format") in ("restic", "hybrid")
-            use_7z = resolved.get("format") in ("7z", "hybrid")
-            hybrid = resolved.get("format") == "hybrid"
+            archive_format = resolved.get("archive_format", "7z")
+            use_restic = resolved.get("use_restic", False)
             op_vault = resolved.get("op_vault")
+
+            # Determine mode for daemon install CLI
+            # Note: daemon install only supports 7z for archives, not tar.gz
+            if use_restic and archive_format:
+                mode = "hybrid"
+            elif use_restic:
+                mode = "restic"
+            else:
+                mode = "7z"
 
             self.notify(f"Installing daemon for {name}...")
             self.call_later(
-                lambda: self._do_daemon_install(source, dest, name, use_restic, use_7z, hybrid, op_vault)
+                lambda: self._do_daemon_install(source, dest, name, mode, op_vault)
             )
         except Exception as e:
             self.notify(f"Failed to install daemon: {e}", severity="error")
 
     def _do_daemon_install(self, source: Path, dest: Path, name: str,
-                           use_restic: bool, use_7z: bool, hybrid: bool, op_vault: str | None) -> None:
+                           mode: str, op_vault: str | None) -> None:
         """Run daemon install in background."""
         import subprocess
 
@@ -2442,13 +2449,8 @@ class SnapbackApp(App):
             "--source", str(source),
             "--dest", str(dest),
             "--name", name,
+            "--mode", mode,
         ]
-        if use_restic:
-            cmd.append("--restic")
-        if not use_7z:
-            cmd.extend(["--format", "tar.gz"])
-        if hybrid:
-            cmd.append("--hybrid")
         if op_vault:
             cmd.extend(["--op-vault", op_vault])
 
@@ -2522,7 +2524,8 @@ class SnapbackApp(App):
         source = job.get("source", "")
         dest = job.get("dest", "")
         name = job.get("name", "")
-        fmt = job.get("format", "7z")
+        archive_format = job.get("archive_format", "7z")
+        use_restic = job.get("use_restic", False)
 
         cmd = [
             sys.executable, __file__,
@@ -2531,12 +2534,14 @@ class SnapbackApp(App):
             "--name", name,
         ]
 
-        if fmt == "restic":
-            cmd.append("--restic")
-        elif fmt == "hybrid":
+        # Add format flags
+        if use_restic and archive_format:
             cmd.append("--hybrid")
-        elif fmt == "tar.gz":
-            cmd.extend(["--format", "tar.gz"])
+        elif use_restic:
+            cmd.append("--restic")
+        elif archive_format == "tar.gz":
+            cmd.append("--tar-gz")
+        # else: defaults to 7z
 
         if job.get("op_vault"):
             cmd.extend(["--op-vault", job["op_vault"]])
