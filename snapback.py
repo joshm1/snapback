@@ -105,8 +105,12 @@ def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
     key = get_job_key(source)
 
     # Preserve existing options (like op_vault from daemon install)
-    existing_options = jobs.get(key, {}).get("options", {})
+    existing_job = jobs.get(key, {})
+    existing_options = existing_job.get("options", {})
     merged_options = {**existing_options, **options}
+
+    # Preserve last_runs if it exists
+    last_runs = existing_job.get("last_runs", {})
 
     jobs[key] = {
         "source": str(source),
@@ -115,6 +119,9 @@ def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
         "options": merged_options,
         "last_saved": datetime.now().isoformat(),
     }
+    if last_runs:
+        jobs[key]["last_runs"] = last_runs
+
     save_jobs(jobs)
     logger.debug(f"Saved job config for {source}")
 
@@ -229,7 +236,7 @@ class BackupConfig:
 
     @property
     def restic_repo(self) -> Path:
-        return self.backup_dir / f"{self.name}_restic"
+        return self.backup_dir / self.name / "restic"
 
     @property
     def restic_password_file(self) -> Path:
@@ -295,9 +302,10 @@ def check_dest_accessible() -> bool:
 def ensure_backup_dir() -> bool:
     """Create backup directory if it doesn't exist."""
     assert _config is not None
-    if not _config.backup_dir.exists():
-        logger.info(f"Creating backup directory: {_config.backup_dir}")
-        _config.backup_dir.mkdir(parents=True, exist_ok=True)
+    job_backup_dir = _config.backup_dir / _config.name
+    if not job_backup_dir.exists():
+        logger.info(f"Creating backup directory: {job_backup_dir}")
+        job_backup_dir.mkdir(parents=True, exist_ok=True)
     return True
 
 
@@ -305,7 +313,8 @@ def get_existing_backups() -> list[tuple[Path, datetime]]:
     """Get list of existing backups with their timestamps."""
     assert _config is not None
     backups = []
-    if not _config.backup_dir.exists():
+    job_backup_dir = _config.backup_dir / _config.name
+    if not job_backup_dir.exists():
         return backups
 
     # Look for both split volumes (.7z.001) and single files (.7z, .tar.gz)
@@ -318,7 +327,7 @@ def get_existing_backups() -> list[tuple[Path, datetime]]:
 
     seen_timestamps = set()
     for pattern in patterns:
-        for f in _config.backup_dir.glob(pattern):
+        for f in job_backup_dir.glob(pattern):
             try:
                 # Extract date from filename, handling split volume extensions
                 stem = f.stem
@@ -344,6 +353,81 @@ def get_last_backup_time() -> datetime | None:
     backups = get_existing_backups()
     if backups:
         return backups[0][1]
+    return None
+
+
+def get_last_backup_time_for_job(dest: str, name: str) -> datetime | None:
+    """Get the timestamp of the most recent full backup for a job (without needing _config)."""
+    # New structure: dest/name/ contains backups
+    backup_dir = Path(dest) / name
+    if not backup_dir.exists():
+        # Fall back to old structure: dest/ contains backups
+        backup_dir = Path(dest)
+        if not backup_dir.exists():
+            return None
+
+    prefix = f"{name}_"
+    patterns = [f"{prefix}*.7z", f"{prefix}*.7z.*", f"{prefix}*.tar.gz"]
+
+    backups = []
+    seen_timestamps = set()
+    for pattern in patterns:
+        for f in backup_dir.glob(pattern):
+            try:
+                stem = f.stem
+                if stem.endswith(".7z"):
+                    stem = stem[:-3]
+                date_str = stem.replace(prefix, "")
+                backup_time = datetime.strptime(date_str, "%Y-%m-%d_%H%M%S")
+                if date_str not in seen_timestamps:
+                    seen_timestamps.add(date_str)
+                    backups.append(backup_time)
+            except ValueError:
+                pass
+
+    if backups:
+        return max(backups)
+    return None
+
+
+def get_last_restic_time_for_job(dest: str, name: str) -> datetime | None:
+    """Get the timestamp of the most recent restic snapshot for a job (without needing _config)."""
+    # New structure: dest/name/restic
+    restic_repo = Path(dest) / name / "restic"
+    if not restic_repo.exists():
+        # Fall back to old structure: dest/{name}_restic
+        restic_repo = Path(dest) / f"{name}_restic"
+        if not restic_repo.exists():
+            return None
+
+    # Get password from cached password file
+    password_file = Path.home() / ".config/restic" / f"{name}-password"
+    if not password_file.exists():
+        return None
+
+    env = os.environ.copy()
+    env["RESTIC_PASSWORD_FILE"] = str(password_file)
+
+    result = subprocess.run(
+        ["restic", "-r", str(restic_repo), "snapshots", "--json"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    try:
+        snapshots = json.loads(result.stdout) or []
+        if not snapshots:
+            return None
+        latest = max(snapshots, key=lambda s: s.get("time", ""))
+        time_str = latest.get("time", "")
+        if time_str:
+            time_str = time_str.split(".")[0]
+            return datetime.fromisoformat(time_str)
+    except (json.JSONDecodeError, ValueError):
+        pass
     return None
 
 
@@ -684,7 +768,7 @@ def create_backup(dry_run: bool = False) -> Path | None:
     assert _config is not None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     backup_name = f"{_config.backup_prefix}{timestamp}{_config.backup_suffix}"
-    backup_path = _config.backup_dir / backup_name
+    backup_path = _config.backup_dir / _config.name / backup_name
 
     exclude_args = []
     for d in _config.excludes_for_full:
@@ -1061,7 +1145,7 @@ def create_7z_backup(dry_run: bool = False) -> Path | None:
     assert _config is not None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     backup_name = f"{_config.backup_prefix}{timestamp}{_config.backup_suffix}"
-    backup_path = _config.backup_dir / backup_name
+    backup_path = _config.backup_dir / _config.name / backup_name
 
     # Build exclusion args for 7z
     exclude_args = []
@@ -1259,10 +1343,14 @@ def run_hybrid_backup(force: bool, auto: bool, dry_run: bool) -> int:
 PLIST_TEMPLATE = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Snapback v{version}
+  Generated: {generated_at}
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.snapback.{name}</string>
+    <string>{label}</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -1300,9 +1388,48 @@ PLIST_TEMPLATE = """\
 """
 
 
+DAEMON_NAMESPACE = "io.github.joshm1.snapback"
+
+
+def get_plist_version(plist_path: Path) -> str | None:
+    """Extract snapback version from a plist file's comment header."""
+    if not plist_path.exists():
+        return None
+    try:
+        content = plist_path.read_text()
+        # Look for: Snapback v0.1.0
+        import re
+        match = re.search(r"Snapback v([\d.]+)", content)
+        if match:
+            return match.group(1)
+        return None
+    except Exception:
+        return None
+
+
+def get_daemon_label(name: str) -> str:
+    """Get the launchd label for a named daemon."""
+    return f"{DAEMON_NAMESPACE}.{name}"
+
+
 def get_plist_path(name: str) -> Path:
     """Get the path to the plist file for a named daemon."""
-    return Path.home() / "Library/LaunchAgents" / f"com.snapback.{name}.plist"
+    return Path.home() / "Library/LaunchAgents" / f"{get_daemon_label(name)}.plist"
+
+
+def find_plist_path(name: str) -> Path | None:
+    """Find plist file for a daemon, checking current and legacy namespaces."""
+    # Check current namespace first
+    current = get_plist_path(name)
+    if current.exists():
+        return current
+
+    # Check legacy namespace (com.snapback.{name})
+    legacy = Path.home() / "Library/LaunchAgents" / f"com.snapback.{name}.plist"
+    if legacy.exists():
+        return legacy
+
+    return None
 
 
 def get_log_path(name: str) -> Path:
@@ -1699,6 +1826,9 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
 
     # Generate plist content (no 1password flags - daemon uses password file)
     plist_content = PLIST_TEMPLATE.format(
+        version=__version__,
+        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        label=get_daemon_label(name),
         name=name,
         snapback_path=snapback_path,
         source=str(source),
@@ -1762,6 +1892,8 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
         full_interval=full_interval,
         op_vault=selected_vault,
         op_item=op_item_name,
+        daemon_plist=str(plist_path),
+        daemon_label=get_daemon_label(name),
     )
 
 
@@ -1796,7 +1928,7 @@ def daemon_status(name):
 
     plist_path = get_plist_path(name)
     log_path = get_log_path(name)
-    label = f"com.snapback.{name}"
+    label = get_daemon_label(name)
 
     # Check if installed
     installed = plist_path.exists()
@@ -1848,6 +1980,259 @@ def daemon_logs(name, lines):
         all_lines = f.readlines()
         for line in all_lines[-lines:]:
             print(line.rstrip())
+
+
+def generate_plist_content(job_name: str, job: dict) -> str:
+    """Generate plist content from job config."""
+    opts = job.get("options", {})
+    source_key = job.get("source", "")
+
+    # Build mode args
+    mode = opts.get("mode", "hybrid")
+    restic_interval = opts.get("restic_interval", DEFAULT_RESTIC_INTERVAL_HOURS)
+    full_interval = opts.get("full_interval", DEFAULT_FULL_INTERVAL_DAYS)
+
+    if mode == "hybrid":
+        mode_args = f"""
+        <string>--hybrid</string>
+        <string>--restic-interval</string>
+        <string>{restic_interval}</string>
+        <string>--full-interval</string>
+        <string>{full_interval}</string>"""
+    elif mode == "restic":
+        mode_args = """
+        <string>--restic</string>"""
+    else:
+        mode_args = """
+        <string>--7z</string>"""
+
+    return PLIST_TEMPLATE.format(
+        version=__version__,
+        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        label=get_daemon_label(job_name),
+        name=job_name,
+        snapback_path=find_snapback_path(),
+        source=source_key,
+        dest=job.get("dest", ""),
+        log_path=str(get_log_path(job_name)),
+        home=str(Path.home()),
+        interval_seconds=3600,
+        mode_args=mode_args,
+    )
+
+
+@daemon.command("update")
+@click.option("--yes", "-y", is_flag=True, help="Skip selection and confirmation prompts (update all outdated)")
+def daemon_update(yes):
+    """Update daemon plists to the latest version.
+
+    Shows a multi-select list of outdated daemons, then displays a diff
+    for each selected one and asks for confirmation before applying.
+    """
+    setup_logging()
+    import difflib
+    import questionary
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+
+    jobs = load_jobs()
+
+    # Get launchctl status once
+    launchctl_result = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+
+    # Collect outdated daemons
+    outdated = []
+    for source_key, job in jobs.items():
+        job_name = job.get("name", "unnamed")
+        found_plist = find_plist_path(job_name)
+        if not found_plist:
+            continue
+        plist_version = get_plist_version(found_plist)
+        if plist_version != __version__:
+            outdated.append({
+                "source_key": source_key,
+                "job": job,
+                "job_name": job_name,
+                "found_plist": found_plist,
+                "plist_version": plist_version,
+            })
+
+    if not outdated:
+        console.print("[green]All daemons are up to date.[/green]")
+        return
+
+    # Let user select which to update (unless --yes)
+    if yes:
+        selected_names = [d["job_name"] for d in outdated]
+    else:
+        choices = [
+            questionary.Choice(
+                title=f"{d['job_name']} ({d['plist_version'] or 'no version'} → {__version__})",
+                value=d["job_name"],
+                checked=True,
+            )
+            for d in outdated
+        ]
+        selected_names = questionary.checkbox(
+            "Select daemons to update:",
+            choices=choices,
+        ).ask()
+
+        if selected_names is None:  # User cancelled
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+        if not selected_names:
+            console.print("[dim]No daemons selected.[/dim]")
+            return
+
+    # Filter to selected
+    selected = [d for d in outdated if d["job_name"] in selected_names]
+
+    updated = 0
+    skipped = 0
+
+    for daemon_info in selected:
+        job_name = daemon_info["job_name"]
+        job = daemon_info["job"]
+        found_plist = daemon_info["found_plist"]
+        plist_version = daemon_info["plist_version"]
+        source_key = daemon_info["source_key"]
+
+        # Read current plist
+        old_content = found_plist.read_text()
+
+        # Generate new plist
+        new_content = generate_plist_content(job_name, job)
+
+        # Determine new path
+        new_plist_path = get_plist_path(job_name)
+        old_label = found_plist.stem
+        new_label = get_daemon_label(job_name)
+
+        # Show header
+        console.print(f"\n[bold cyan]{'─' * 60}[/bold cyan]")
+        console.print(f"[bold]{job_name}[/bold]: {plist_version or 'no version'} → {__version__}")
+        if found_plist != new_plist_path:
+            console.print(f"[dim]Path: {found_plist.name} → {new_plist_path.name}[/dim]")
+
+        # Generate and show diff
+        diff = list(difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=found_plist.name,
+            tofile=new_plist_path.name,
+        ))
+
+        if diff:
+            diff_text = ''.join(diff)
+            syntax = Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+            console.print(Panel(syntax, title="[bold]Changes[/bold]", border_style="dim"))
+        else:
+            console.print("[dim]No content changes (only metadata)[/dim]")
+
+        # Ask for confirmation (unless --yes)
+        if not yes:
+            if not click.confirm("Apply this update?", default=True):
+                logger.info(f"Skipped {job_name}")
+                skipped += 1
+                continue
+
+        # Check if daemon is running
+        was_running = old_label in launchctl_result.stdout
+
+        # Unload old daemon
+        if was_running:
+            subprocess.run(["launchctl", "unload", str(found_plist)], capture_output=True)
+
+        # Remove old plist if different path
+        if found_plist != new_plist_path and found_plist.exists():
+            found_plist.unlink()
+
+        # Write new plist
+        new_plist_path.write_text(new_content)
+
+        # Update job config
+        save_job_config(
+            Path(source_key), Path(job.get("dest", "")), job_name,
+            daemon_plist=str(new_plist_path),
+            daemon_label=new_label,
+        )
+
+        # Reload daemon
+        result = subprocess.run(["launchctl", "load", str(new_plist_path)], capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.success(f"Updated and restarted {job_name}")
+        else:
+            logger.warning(f"Updated but failed to reload: {result.stderr}")
+
+        updated += 1
+
+    console.print(f"\n[bold]Done:[/bold] {updated} updated, {skipped} skipped")
+
+
+@daemon.command("plist")
+@click.option("--name", "-N", help="Show plist for specific daemon (shows all if not specified)")
+@click.option("--raw", is_flag=True, help="Output raw plist content without formatting")
+def daemon_plist(name, raw):
+    """Show plist files for installed daemons.
+
+    Without --name, shows all installed snapback daemons.
+    With --name, shows the plist for that specific daemon.
+    """
+    setup_logging()
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+
+    launch_agents_dir = Path.home() / "Library/LaunchAgents"
+
+    if name:
+        # Show specific daemon
+        plist_path = get_plist_path(name)
+        if not plist_path.exists():
+            raise click.ClickException(f"Daemon '{name}' is not installed (no plist at {plist_path})")
+
+        content = plist_path.read_text()
+        if raw:
+            print(content)
+        else:
+            syntax = Syntax(content, "xml", theme="monokai", line_numbers=True)
+            console.print(Panel(syntax, title=f"[bold]{plist_path.name}[/bold]", subtitle=str(plist_path)))
+    else:
+        # Show all snapback daemons - check both jobs.json and filesystem
+        plist_files_set = set()
+
+        # Check jobs.json for stored plist paths
+        jobs = load_jobs()
+        for job in jobs.values():
+            stored_plist = job.get("options", {}).get("daemon_plist")
+            if stored_plist and Path(stored_plist).exists():
+                plist_files_set.add(Path(stored_plist))
+
+        # Also check current and legacy namespaces in filesystem
+        plist_files_set.update(launch_agents_dir.glob(f"{DAEMON_NAMESPACE}.*.plist"))
+        plist_files_set.update(launch_agents_dir.glob("com.snapback.*.plist"))
+
+        plist_files = sorted(plist_files_set)
+
+        if not plist_files:
+            logger.info("No snapback daemons installed.")
+            logger.info("Install with: snapback daemon install --source <path> --dest <path> --name <name>")
+            return
+
+        logger.info(f"Found {len(plist_files)} installed daemon(s):\n")
+
+        for plist_path in plist_files:
+            content = plist_path.read_text()
+
+            if raw:
+                print(f"=== {plist_path.name} ===")
+                print(content)
+                print()
+            else:
+                syntax = Syntax(content, "xml", theme="monokai", line_numbers=True)
+                console.print(Panel(syntax, title=f"[bold]{plist_path.name}[/bold]", subtitle=str(plist_path)))
+                console.print()
 
 
 # =============================================================================
@@ -1941,6 +2326,194 @@ def remove_job(source):
     save_jobs(jobs)
 
     logger.success(f"Removed job '{name}' ({source})")
+
+
+@cli.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def list_all_jobs(as_json):
+    """List all backup jobs with stats and daemon status.
+
+    Shows every directory you've backed up, including:
+    - Last backup times (restic, 7z/tar.gz)
+    - Daemon status (installed, running)
+    - Backup mode and settings
+    """
+    setup_logging()
+    from rich.table import Table
+
+    jobs = load_jobs()
+
+    if not jobs:
+        logger.info("No backup jobs found.")
+        logger.info("Run a backup to create a job, or use 'snapback daemon install'.")
+        return
+
+    if as_json:
+        # Add daemon status to each job
+        result = {}
+        launchctl_result = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+
+        for source_key, job in jobs.items():
+            name = job.get("name", "unnamed")
+            opts = job.get("options", {})
+
+            # Check stored path first, then search for plist
+            stored_plist = opts.get("daemon_plist")
+            stored_label = opts.get("daemon_label")
+            if stored_plist and Path(stored_plist).exists():
+                plist_path = Path(stored_plist)
+                label = stored_label or get_daemon_label(name)
+                daemon_installed = True
+            else:
+                found_plist = find_plist_path(name)
+                if found_plist:
+                    plist_path = found_plist
+                    daemon_installed = True
+                    label = plist_path.stem
+                else:
+                    plist_path = get_plist_path(name)
+                    label = get_daemon_label(name)
+                    daemon_installed = False
+
+            daemon_running = label in launchctl_result.stdout if label else False
+
+            plist_version = get_plist_version(plist_path) if daemon_installed else None
+
+            result[source_key] = {
+                **job,
+                "daemon": {
+                    "installed": daemon_installed,
+                    "running": daemon_running,
+                    "plist_path": str(plist_path) if daemon_installed else None,
+                    "label": label,
+                    "plist_version": plist_version,
+                    "current_version": __version__,
+                    "outdated": plist_version is not None and plist_version != __version__,
+                }
+            }
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    # Rich table output
+    table = Table(title="Snapback Jobs", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Source")
+    table.add_column("Mode")
+    table.add_column("Last Restic")
+    table.add_column("Last Full")
+    table.add_column("Daemon")
+    table.add_column("Version")
+
+    # Get launchctl list once
+    launchctl_result = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+
+    for source_key, job in sorted(jobs.items(), key=lambda x: x[1].get("name", "")):
+        name = job.get("name", "unnamed")
+        opts = job.get("options", {})
+        last_runs = job.get("last_runs", {})
+
+        # Mode
+        mode = opts.get("mode", "")
+        if not mode:
+            if opts.get("hybrid"):
+                mode = "hybrid"
+            elif opts.get("restic"):
+                mode = "restic"
+            else:
+                mode = "7z" if opts.get("use_7z", True) else "tar.gz"
+
+        # Last runs - check jobs.json first, then fall back to checking actual files
+        dest = job.get("dest", "")
+
+        last_restic_str = last_runs.get("restic") or last_runs.get("hybrid")
+        last_full_str = last_runs.get("7z") or last_runs.get("tar.gz") or last_runs.get("hybrid")
+
+        # Fall back to checking actual backup files if not in jobs.json
+        last_restic_dt = None
+        last_full_dt = None
+
+        if last_restic_str:
+            try:
+                last_restic_dt = datetime.fromisoformat(last_restic_str)
+            except ValueError:
+                pass
+        elif dest:
+            last_restic_dt = get_last_restic_time_for_job(dest, name)
+
+        if last_full_str:
+            try:
+                last_full_dt = datetime.fromisoformat(last_full_str)
+            except ValueError:
+                pass
+        elif dest:
+            last_full_dt = get_last_backup_time_for_job(dest, name)
+
+        def format_timestamp(dt: datetime | None) -> str:
+            if not dt:
+                return "[dim]never[/dim]"
+            age = datetime.now() - dt
+            return f"{format_age(age)}"
+
+        # Daemon status - check stored path first, then search for plist
+        stored_plist = opts.get("daemon_plist")
+        stored_label = opts.get("daemon_label")
+        if stored_plist and Path(stored_plist).exists():
+            plist_path = Path(stored_plist)
+            label = stored_label or get_daemon_label(name)
+            daemon_installed = True
+        else:
+            # Search for plist (current namespace, then legacy)
+            found_plist = find_plist_path(name)
+            if found_plist:
+                plist_path = found_plist
+                daemon_installed = True
+                # Extract label from plist filename
+                label = plist_path.stem  # e.g., "com.snapback.myname"
+            else:
+                plist_path = get_plist_path(name)
+                label = get_daemon_label(name)
+                daemon_installed = False
+        daemon_running = label in launchctl_result.stdout if label else False
+
+        if daemon_running:
+            daemon_status = "[green]running[/green]"
+        elif daemon_installed:
+            daemon_status = "[yellow]stopped[/yellow]"
+        else:
+            daemon_status = "[dim]none[/dim]"
+
+        # Check plist version
+        if daemon_installed:
+            plist_version = get_plist_version(plist_path)
+            if plist_version is None:
+                version_status = "[yellow]no version[/yellow]"
+            elif plist_version == __version__:
+                version_status = f"[green]{plist_version}[/green]"
+            else:
+                version_status = f"[red]{plist_version} → {__version__}[/red]"
+        else:
+            version_status = "[dim]-[/dim]"
+
+        # Shorten source path for display
+        source_display = source_key
+        home = str(Path.home())
+        if source_display.startswith(home):
+            source_display = "~" + source_display[len(home):]
+        if len(source_display) > 35:
+            source_display = "..." + source_display[-32:]
+
+        table.add_row(
+            name,
+            source_display,
+            mode,
+            format_timestamp(last_restic_dt),
+            format_timestamp(last_full_dt),
+            daemon_status,
+            version_status,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Config: {JOBS_FILE}[/dim]")
 
 
 def main() -> int:
