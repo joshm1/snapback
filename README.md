@@ -8,6 +8,7 @@ A flexible backup tool that supports both traditional compressed archives (7z/ta
 - **7z format by default**: Better compression than tar.gz, with automatic 50MB volume splitting
 - **Space efficient**: Restic deduplicates at the block level, typically 40x smaller than full backups over time
 - **Smart scheduling**: Only backup when needed based on configurable time thresholds
+- **Battery aware**: Skips backups when on battery power (in auto mode) to save energy
 - **1Password integration**: Optionally backup restic passwords to 1Password for safekeeping
 - **Interactive daemon setup**: Easy `daemon install` command with guided mode selection
 - **macOS notifications**: Get notified on backup success or failure
@@ -159,8 +160,8 @@ daemon install options:
   --dest, -d PATH        Destination directory (required)
   --name, -N NAME        Backup name (required)
   --mode, -m MODE        Backup mode: hybrid, restic, or 7z (prompts if not specified)
-  --restic-interval N    Hours between restic backups (default: 4)
-  --full-interval N      Days between full 7z backups (default: 7)
+  --restic-interval N    Min hours between restic backups (default: 4)
+  --full-interval N      Min days between full 7z backups (default: 7)
   --1password            Backup restic password to 1Password
   --1password-vault      1Password vault name
 ```
@@ -182,7 +183,7 @@ snapback daemon uninstall --name myapp
 
 - **Logs**: `~/Library/Logs/snapback-{name}.log` (viewable in Console.app)
 - **Plist**: `~/Library/LaunchAgents/com.snapback.{name}.plist`
-- **Schedule**: Runs at the configured interval and on login/wake
+- **Schedule**: Checks hourly (and on login/wake), backs up only when needed
 
 ## 1Password Integration
 
