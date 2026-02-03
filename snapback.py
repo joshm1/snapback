@@ -32,6 +32,11 @@ import rich_click as click
 from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet, Static
 
 # Rich-click configuration
 click.rich_click.USE_RICH_MARKUP = True
@@ -1899,6 +1904,115 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
         update_job_last_run(source, backup_type_for_save)
 
     ctx.exit(0 if result else 1)
+
+
+class SnapbackApp(App):
+    """Textual app for managing snapback jobs."""
+
+    CSS = """
+    Screen {
+        align: center middle;
+    }
+
+    #jobs-table {
+        height: 1fr;
+        margin: 1 2;
+    }
+
+    Footer {
+        background: $primary-background;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("a", "add_job", "Add"),
+        Binding("e", "edit_job", "Edit"),
+        Binding("d", "delete_job", "Delete"),
+        Binding("i", "install_daemon", "Install"),
+        Binding("u", "uninstall_daemon", "Uninstall"),
+        Binding("r", "run_now", "Run"),
+        Binding("s", "edit_defaults", "Defaults"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="jobs-table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.add_columns("NAME", "SOURCE", "DEST", "FORMAT", "DAEMON", "LAST RUN")
+        self.refresh_jobs()
+
+    def refresh_jobs(self) -> None:
+        """Refresh the jobs table from manifest."""
+        table = self.query_one(DataTable)
+        table.clear()
+
+        manifest = load_manifest()
+        state = load_state()
+        defaults = manifest.get("defaults", {})
+
+        for job in manifest.get("jobs", []):
+            resolved = resolve_job_config(job, defaults)
+            source = job.get("source", "")
+            key = get_job_key(Path(source)) if source else ""
+            job_state = state.get(key, {})
+
+            # Daemon status
+            daemon_plist = job_state.get("daemon_plist", "")
+            daemon_status = "●" if daemon_plist and Path(daemon_plist).exists() else "○"
+
+            # Last run
+            last_runs = job_state.get("last_runs", {})
+            last_run = "never"
+            if last_runs:
+                latest = max(last_runs.values())
+                try:
+                    dt = datetime.fromisoformat(latest)
+                    delta = datetime.now() - dt
+                    if delta.days > 0:
+                        last_run = f"{delta.days}d ago"
+                    elif delta.seconds >= 3600:
+                        last_run = f"{delta.seconds // 3600}h ago"
+                    else:
+                        last_run = f"{delta.seconds // 60}m ago"
+                except ValueError:
+                    last_run = latest
+
+            table.add_row(
+                resolved.get("name", ""),
+                source,
+                resolved.get("dest", ""),
+                resolved.get("format", "7z"),
+                daemon_status,
+                last_run,
+            )
+
+    def action_quit(self) -> None:
+        self.exit()
+
+    def action_add_job(self) -> None:
+        self.notify("Add job (not implemented yet)")
+
+    def action_edit_job(self) -> None:
+        self.notify("Edit job (not implemented yet)")
+
+    def action_delete_job(self) -> None:
+        self.notify("Delete job (not implemented yet)")
+
+    def action_install_daemon(self) -> None:
+        self.notify("Install daemon (not implemented yet)")
+
+    def action_uninstall_daemon(self) -> None:
+        self.notify("Uninstall daemon (not implemented yet)")
+
+    def action_run_now(self) -> None:
+        self.notify("Run now (not implemented yet)")
+
+    def action_edit_defaults(self) -> None:
+        self.notify("Edit defaults (not implemented yet)")
 
 
 @cli.group()
