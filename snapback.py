@@ -2838,6 +2838,13 @@ def list_all_jobs(as_json):
     console.print(f"\n[dim]Config: {JOBS_FILE}[/dim]")
 
 
+@cli.command()
+def configure():
+    """Launch interactive configuration editor."""
+    app = SnapbackApp()
+    app.run()
+
+
 def main() -> int:
     """Main entry point."""
     try:
