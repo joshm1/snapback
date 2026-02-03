@@ -2209,10 +2209,106 @@ class SnapbackApp(App):
             self.notify(f"Deleted job: {deleted.get('name')}")
 
     def action_install_daemon(self) -> None:
-        self.notify("Install daemon (not implemented yet)")
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        resolved = resolve_job_config(job, defaults)
+
+        source = Path(resolved.get("source", "")).expanduser()
+        dest = Path(resolved.get("dest", "")).expanduser()
+        name = resolved.get("name", "")
+
+        if not source.exists():
+            self.notify(f"Source does not exist: {source}", severity="error")
+            return
+
+        # Call the daemon install logic
+        try:
+            # Build options
+            use_restic = resolved.get("format") in ("restic", "hybrid")
+            use_7z = resolved.get("format") in ("7z", "hybrid")
+            hybrid = resolved.get("format") == "hybrid"
+            op_vault = resolved.get("op_vault")
+
+            self.notify(f"Installing daemon for {name}...")
+            self.call_later(
+                lambda: self._do_daemon_install(source, dest, name, use_restic, use_7z, hybrid, op_vault)
+            )
+        except Exception as e:
+            self.notify(f"Failed to install daemon: {e}", severity="error")
+
+    def _do_daemon_install(self, source: Path, dest: Path, name: str,
+                           use_restic: bool, use_7z: bool, hybrid: bool, op_vault: str | None) -> None:
+        """Run daemon install in background."""
+        import subprocess
+
+        cmd = [
+            sys.executable, __file__, "daemon", "install",
+            "--source", str(source),
+            "--dest", str(dest),
+            "--name", name,
+        ]
+        if use_restic:
+            cmd.append("--restic")
+        if not use_7z:
+            cmd.extend(["--format", "tar.gz"])
+        if hybrid:
+            cmd.append("--hybrid")
+        if op_vault:
+            cmd.extend(["--op-vault", op_vault])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.notify(f"Daemon installed for {name}")
+        else:
+            self.notify(f"Daemon install failed: {result.stderr}", severity="error")
+
+        self.refresh_jobs()
 
     def action_uninstall_daemon(self) -> None:
-        self.notify("Uninstall daemon (not implemented yet)")
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        name = job.get("name", "")
+
+        self.push_screen(
+            ConfirmModal(f"Uninstall daemon for '{name}'?"),
+            lambda result: self._on_uninstall_confirmed(result, name)
+        )
+
+    def _on_uninstall_confirmed(self, confirmed: bool, name: str) -> None:
+        if not confirmed:
+            return
+
+        import subprocess
+
+        cmd = [sys.executable, __file__, "daemon", "uninstall", "--name", name]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.notify(f"Daemon uninstalled for {name}")
+        else:
+            self.notify(f"Uninstall failed: {result.stderr}", severity="error")
+
+        self.refresh_jobs()
 
     def action_run_now(self) -> None:
         self.notify("Run now (not implemented yet)")
