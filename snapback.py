@@ -1906,6 +1906,104 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     ctx.exit(0 if result else 1)
 
 
+class EditJobModal(ModalScreen):
+    """Modal for editing a job."""
+
+    CSS = """
+    EditJobModal {
+        align: center middle;
+    }
+
+    #edit-dialog {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #edit-dialog Label {
+        margin-top: 1;
+    }
+
+    #edit-dialog Input {
+        margin-bottom: 1;
+    }
+
+    #buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, job: dict | None = None, defaults: dict | None = None) -> None:
+        super().__init__()
+        self.job = job or {}
+        self.defaults = defaults or {}
+        self.is_new = job is None
+
+    def compose(self) -> ComposeResult:
+        resolved = resolve_job_config(self.job, self.defaults) if self.job else self.defaults
+
+        with Vertical(id="edit-dialog"):
+            yield Label("Name:")
+            yield Input(value=self.job.get("name", ""), id="name-input", placeholder="job-name")
+
+            yield Label("Source:")
+            yield Input(value=self.job.get("source", ""), id="source-input", placeholder="~/path/to/source")
+
+            dest_value = self.job.get("dest", "")
+            dest_placeholder = f"{self.defaults.get('dest', '~/Backups')} (inherited)"
+            yield Label("Dest:")
+            yield Input(value=dest_value, id="dest-input", placeholder=dest_placeholder)
+
+            yield Label("Format:")
+            with RadioSet(id="format-radio"):
+                current_format = resolved.get("format", "7z")
+                yield RadioButton("tar.gz", value=current_format == "tar.gz")
+                yield RadioButton("7z", value=current_format == "7z")
+                yield RadioButton("restic", value=current_format == "restic")
+                yield RadioButton("hybrid", value=current_format == "hybrid")
+
+            yield Label("1Password Vault (optional):")
+            yield Input(value=self.job.get("op_vault", ""), id="op-vault-input", placeholder="Vault name")
+
+            with Horizontal(id="buttons"):
+                yield Button("Save", variant="primary", id="save-btn")
+                yield Button("Cancel", id="cancel-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-btn":
+            name = self.query_one("#name-input", Input).value.strip()
+            source = self.query_one("#source-input", Input).value.strip()
+            dest = self.query_one("#dest-input", Input).value.strip()
+            op_vault = self.query_one("#op-vault-input", Input).value.strip()
+
+            radio_set = self.query_one("#format-radio", RadioSet)
+            format_map = {0: "tar.gz", 1: "7z", 2: "restic", 3: "hybrid"}
+            format_value = format_map.get(radio_set.pressed_index, "7z")
+
+            if not name or not source:
+                self.notify("Name and source are required", severity="error")
+                return
+
+            new_job = {"name": name, "source": source}
+            if dest:
+                new_job["dest"] = dest
+            if format_value != self.defaults.get("format", "7z"):
+                new_job["format"] = format_value
+            if op_vault:
+                new_job["op_vault"] = op_vault
+
+            self.dismiss(new_job)
+        else:
+            self.dismiss(None)
+
+
 class SnapbackApp(App):
     """Textual app for managing snapback jobs."""
 
@@ -1994,10 +2092,48 @@ class SnapbackApp(App):
         self.exit()
 
     def action_add_job(self) -> None:
-        self.notify("Add job (not implemented yet)")
+        manifest = load_manifest()
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditJobModal(job=None, defaults=defaults), self._on_job_edited)
 
     def action_edit_job(self) -> None:
-        self.notify("Edit job (not implemented yet)")
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditJobModal(job=job, defaults=defaults), self._on_job_edited)
+
+    def _on_job_edited(self, result: dict | None) -> None:
+        if result is None:
+            return
+
+        manifest = load_manifest()
+
+        # Check if editing existing or adding new
+        existing_idx = None
+        for i, job in enumerate(manifest.get("jobs", [])):
+            if job.get("name") == result.get("name"):
+                existing_idx = i
+                break
+
+        if existing_idx is not None:
+            manifest["jobs"][existing_idx] = result
+        else:
+            if "jobs" not in manifest:
+                manifest["jobs"] = []
+            manifest["jobs"].append(result)
+
+        save_manifest(manifest)
+        self.refresh_jobs()
+        self.notify(f"Saved job: {result.get('name')}")
 
     def action_delete_job(self) -> None:
         self.notify("Delete job (not implemented yet)")
