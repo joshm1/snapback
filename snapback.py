@@ -2063,7 +2063,10 @@ class EditJobModal(ModalScreen):
             yield Checkbox("Enable restic", value=resolved.get("use_restic", False), id="use-restic-checkbox")
 
             yield Label("1Password Vault (optional):")
-            yield Input(value=self.job.get("op_vault", ""), id="op-vault-input", placeholder="Vault name")
+            op_vault_value = self.job.get("op_vault", "")
+            default_vault = self.defaults.get("op_vault", "")
+            op_vault_placeholder = f"{default_vault} (inherited)" if default_vault else "Vault name"
+            yield Input(value=op_vault_value, id="op-vault-input", placeholder=op_vault_placeholder)
 
             with Horizontal(id="buttons"):
                 yield Button("Save", variant="primary", id="save-btn")
