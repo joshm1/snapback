@@ -1906,6 +1906,47 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     ctx.exit(0 if result else 1)
 
 
+class ConfirmModal(ModalScreen):
+    """Modal for confirmation dialogs."""
+
+    CSS = """
+    ConfirmModal {
+        align: center middle;
+    }
+
+    #confirm-dialog {
+        width: 50;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $error;
+    }
+
+    #confirm-buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #confirm-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self.message)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Yes", variant="error", id="yes-btn")
+                yield Button("No", variant="primary", id="no-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes-btn")
+
+
 class EditJobModal(ModalScreen):
     """Modal for editing a job."""
 
@@ -2136,7 +2177,36 @@ class SnapbackApp(App):
         self.notify(f"Saved job: {result.get('name')}")
 
     def action_delete_job(self) -> None:
-        self.notify("Delete job (not implemented yet)")
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        job_name = job.get("name", "unknown")
+
+        self.push_screen(
+            ConfirmModal(f"Delete job '{job_name}'?"),
+            lambda result: self._on_delete_confirmed(result, table.cursor_row)
+        )
+
+    def _on_delete_confirmed(self, confirmed: bool, index: int) -> None:
+        if not confirmed:
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if index < len(jobs):
+            deleted = jobs.pop(index)
+            manifest["jobs"] = jobs
+            save_manifest(manifest)
+            self.refresh_jobs()
+            self.notify(f"Deleted job: {deleted.get('name')}")
 
     def action_install_daemon(self) -> None:
         self.notify("Install daemon (not implemented yet)")
