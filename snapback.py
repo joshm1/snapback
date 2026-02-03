@@ -17,6 +17,8 @@ For more info: https://github.com/joshm1/snapback
 
 import json
 import tomllib
+from enum import Enum
+from typing import Literal, TypedDict
 
 import tomli_w
 
@@ -27,6 +29,66 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+# =============================================================================
+# Type Definitions
+# =============================================================================
+
+class ArchiveFormat(str, Enum):
+    """Valid archive format values."""
+    NONE = ""
+    SEVENZ = "7z"
+    TAR_GZ = "tar.gz"
+
+
+class DaemonMode(str, Enum):
+    """Valid daemon install mode values."""
+    HYBRID = "hybrid"
+    RESTIC = "restic"
+    SEVENZ = "7z"
+
+
+class ManifestDefaults(TypedDict, total=False):
+    """Type for manifest defaults section."""
+    dest: str
+    archive_format: str  # ArchiveFormat value
+    use_restic: bool
+    restic_interval_hours: int
+    full_interval_days: int
+    op_vault: str
+
+
+class ManifestJob(TypedDict, total=False):
+    """Type for a job in the manifest."""
+    name: str
+    source: str
+    dest: str
+    archive_format: str
+    use_restic: bool
+    op_vault: str
+
+
+class Manifest(TypedDict, total=False):
+    """Type for the full manifest structure."""
+    defaults: ManifestDefaults
+    jobs: list[ManifestJob]
+
+
+# =============================================================================
+# CLI Flag Constants (avoid magic strings)
+# =============================================================================
+
+class CLIFlags:
+    """Constants for CLI flag names to avoid magic strings."""
+    SOURCE = "--source"
+    DEST = "--dest"
+    NAME = "--name"
+    MODE = "--mode"
+    RESTIC = "--restic"
+    HYBRID = "--hybrid"
+    TAR_GZ = "--tar-gz"
+    ONEPASSWORD_VAULT = "--1password-vault"
 
 import rich_click as click
 from loguru import logger
@@ -2426,33 +2488,32 @@ class SnapbackApp(App):
             # Determine mode for daemon install CLI
             # Note: daemon install only supports 7z for archives, not tar.gz
             if use_restic and archive_format:
-                mode = "hybrid"
+                mode = DaemonMode.HYBRID
             elif use_restic:
-                mode = "restic"
+                mode = DaemonMode.RESTIC
             else:
-                mode = "7z"
+                mode = DaemonMode.SEVENZ
 
             self.notify(f"Installing daemon for {name}...")
+            # Capture values to avoid closure issues
             self.call_later(
-                lambda: self._do_daemon_install(source, dest, name, mode, op_vault)
+                lambda s=source, d=dest, n=name, m=mode, o=op_vault: self._do_daemon_install(s, d, n, m, o)
             )
         except Exception as e:
             self.notify(f"Failed to install daemon: {e}", severity="error")
 
     def _do_daemon_install(self, source: Path, dest: Path, name: str,
-                           mode: str, op_vault: str | None) -> None:
+                           mode: DaemonMode, op_vault: str | None) -> None:
         """Run daemon install in background."""
-        import subprocess
-
         cmd = [
             sys.executable, __file__, "daemon", "install",
-            "--source", str(source),
-            "--dest", str(dest),
-            "--name", name,
-            "--mode", mode,
+            CLIFlags.SOURCE, str(source),
+            CLIFlags.DEST, str(dest),
+            CLIFlags.NAME, name,
+            CLIFlags.MODE, mode.value,
         ]
         if op_vault:
-            cmd.extend(["--1password-vault", op_vault])
+            cmd.extend([CLIFlags.ONEPASSWORD_VAULT, op_vault])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -2519,32 +2580,30 @@ class SnapbackApp(App):
 
     def _do_run_backup(self, job: dict) -> None:
         """Run backup in background."""
-        import subprocess
-
-        source = job.get("source", "")
-        dest = job.get("dest", "")
+        source = Path(job.get("source", "")).expanduser()
+        dest = Path(job.get("dest", "")).expanduser()
         name = job.get("name", "")
-        archive_format = job.get("archive_format", "7z")
+        archive_format = job.get("archive_format", ArchiveFormat.SEVENZ.value)
         use_restic = job.get("use_restic", False)
 
         cmd = [
             sys.executable, __file__,
-            "--source", source,
-            "--dest", dest,
-            "--name", name,
+            CLIFlags.SOURCE, str(source),
+            CLIFlags.DEST, str(dest),
+            CLIFlags.NAME, name,
         ]
 
         # Add format flags
         if use_restic and archive_format:
-            cmd.append("--hybrid")
+            cmd.append(CLIFlags.HYBRID)
         elif use_restic:
-            cmd.append("--restic")
-        elif archive_format == "tar.gz":
-            cmd.append("--tar-gz")
+            cmd.append(CLIFlags.RESTIC)
+        elif archive_format == ArchiveFormat.TAR_GZ.value:
+            cmd.append(CLIFlags.TAR_GZ)
         # else: defaults to 7z
 
         if job.get("op_vault"):
-            cmd.extend(["--1password-vault", job["op_vault"]])
+            cmd.extend([CLIFlags.ONEPASSWORD_VAULT, job["op_vault"]])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
