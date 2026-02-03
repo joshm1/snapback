@@ -173,6 +173,72 @@ def update_job_state(source: Path, **updates) -> None:
     save_state(state)
 
 
+def migrate_jobs_json() -> bool:
+    """Migrate jobs.json to manifest.toml + state.json. Returns True if migration occurred."""
+    if not JOBS_FILE.exists():
+        return False
+    if MANIFEST_FILE.exists():
+        return False  # Already migrated
+
+    try:
+        old_jobs = json.loads(JOBS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    if not old_jobs:
+        return False
+
+    manifest = DEFAULT_MANIFEST.copy()
+    manifest["jobs"] = []
+    state: dict = {}
+
+    for key, job_data in old_jobs.items():
+        # Extract config fields
+        job_config = {
+            "name": job_data.get("name", ""),
+            "source": job_data.get("source", ""),
+        }
+
+        # Only add non-default values
+        if job_data.get("dest"):
+            job_config["dest"] = job_data["dest"]
+
+        opts = job_data.get("options", {})
+        if opts.get("use_restic"):
+            job_config["format"] = "restic"
+        elif opts.get("hybrid"):
+            job_config["format"] = "hybrid"
+        elif opts.get("use_7z") is False:
+            job_config["format"] = "tar.gz"
+        # else: inherits default "7z"
+
+        if opts.get("op_vault"):
+            job_config["op_vault"] = opts["op_vault"]
+        if opts.get("restic_interval_hours"):
+            job_config["restic_interval_hours"] = opts["restic_interval_hours"]
+        if opts.get("full_interval_days"):
+            job_config["full_interval_days"] = opts["full_interval_days"]
+
+        manifest["jobs"].append(job_config)
+
+        # Extract state fields
+        job_state = {}
+        if job_data.get("last_runs"):
+            job_state["last_runs"] = job_data["last_runs"]
+        if opts.get("daemon_plist"):
+            job_state["daemon_plist"] = opts["daemon_plist"]
+
+        if job_state:
+            state[key] = job_state
+
+    save_manifest(manifest)
+    if state:
+        save_state(state)
+
+    logger.info(f"Migrated {len(manifest['jobs'])} jobs from jobs.json")
+    return True
+
+
 def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
     """Save configuration for a backup job (merges with existing options)."""
     jobs = load_jobs()
