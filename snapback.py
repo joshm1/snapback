@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Snapback - Hybrid backup tool with tar.gz and restic support.
+Snapback - Backup tool with archive (7z/tar.gz) and restic incremental support.
 
 Usage:
     snapback --source ~/projects/myrepo --dest ~/Backups --name myrepo
     snapback --source ~/projects/myrepo --dest ~/Backups --name myrepo --restic
-    snapback --source ~/projects/myrepo --dest ~/Backups --name myrepo --hybrid --auto
+    snapback --source ~/projects/myrepo --dest ~/Backups --name myrepo --restic --archive-format 7z --auto
 
     # Install as macOS daemon:
     snapback daemon install --source ~/projects/myrepo --dest ~/Backups --name myrepo
@@ -16,6 +16,12 @@ For more info: https://github.com/joshm1/snapback
 """
 
 import json
+import tomllib
+from enum import Enum
+from typing import Literal, TypedDict
+
+import tomli_w
+
 import os
 import secrets
 import subprocess
@@ -24,10 +30,75 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+
+# =============================================================================
+# Type Definitions
+# =============================================================================
+
+class ArchiveFormat(str, Enum):
+    """Valid archive format values."""
+    NONE = ""
+    SEVENZ = "7z"
+    TAR_GZ = "tar.gz"
+
+
+class ManifestDefaults(TypedDict, total=False):
+    """Type for manifest defaults section."""
+    dest: str
+    archive_format: str  # ArchiveFormat value
+    use_restic: bool
+    restic_interval_hours: int
+    full_interval_days: int
+    op_vault: str
+
+
+class ManifestJob(TypedDict, total=False):
+    """Type for a job in the manifest."""
+    name: str
+    source: str
+    dest: str
+    archive_format: str
+    use_restic: bool
+    op_vault: str
+
+
+class Manifest(TypedDict, total=False):
+    """Type for the full manifest structure."""
+    defaults: ManifestDefaults
+    jobs: list[ManifestJob]
+
+
+# =============================================================================
+# CLI Flag Constants (avoid magic strings)
+# =============================================================================
+
+class CLIFlags:
+    """Constants for CLI flag names to avoid magic strings."""
+    SOURCE = "--source"
+    DEST = "--dest"
+    NAME = "--name"
+    RESTIC = "--restic"
+    NO_RESTIC = "--no-restic"
+    ARCHIVE_FORMAT = "--archive-format"
+    SEVENZ = "--7z"
+    TAR_GZ = "--tar-gz"
+    NO_ARCHIVE = "--no-archive"
+    RESTIC_INTERVAL = "--restic-interval"
+    FULL_INTERVAL = "--full-interval"
+    ONEPASSWORD_VAULT = "--1password-vault"
+    AUTO = "--auto"
+    FORCE = "--force"
+
 import rich_click as click
 from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet, Static
 
 # Rich-click configuration
 click.rich_click.USE_RICH_MARKUP = True
@@ -43,6 +114,9 @@ __version__ = "0.1.0"
 # Config directory for job metadata
 CONFIG_DIR = Path.home() / ".config" / "snapback"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
+MANIFEST_FILE = CONFIG_DIR / "manifest.toml"
+STATE_FILE = CONFIG_DIR / "state.json"
+LOGS_DIR = Path.cwd() / "logs"
 
 # Global flag for notifications
 _notify_enabled = False
@@ -79,24 +153,264 @@ def is_on_battery() -> bool:
 
 
 def load_jobs() -> dict:
-    """Load saved job configurations."""
-    if not JOBS_FILE.exists():
-        return {}
-    try:
-        return json.loads(JOBS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+    """Load saved job configurations (from manifest, keyed by resolved source path)."""
+    # Try migration first
+    migrate_jobs_json()
+
+    manifest = load_manifest()
+    state = load_state()
+    defaults = manifest.get("defaults", {})
+    jobs = {}
+
+    for job in manifest.get("jobs", []):
+        source = job.get("source", "")
+        if not source:
+            continue
+        key = get_job_key(Path(source))
+        resolved = resolve_job_config(job, defaults)
+
+        # Merge in state data for backward compatibility
+        job_state = state.get(key, {})
+
+        archive_format = resolved.get("archive_format", "")
+        use_restic = resolved.get("use_restic", False)
+
+        jobs[key] = {
+            "source": source,
+            "dest": resolved.get("dest", ""),
+            "name": resolved.get("name", ""),
+            "options": {
+                "archive_format": archive_format,
+                "use_7z": archive_format == "7z",
+                "use_tar_gz": archive_format == "tar.gz",
+                "use_restic": use_restic,
+                "hybrid": use_restic and archive_format != "",  # backward compat
+                "op_vault": resolved.get("op_vault"),
+                "restic_interval_hours": resolved.get("restic_interval_hours"),
+                "full_interval_days": resolved.get("full_interval_days"),
+                "daemon_plist": job_state.get("daemon_plist"),
+            },
+            "last_runs": job_state.get("last_runs", {}),
+        }
+
+    return jobs
 
 
 def save_jobs(jobs: dict) -> None:
-    """Save job configurations."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    JOBS_FILE.write_text(json.dumps(jobs, indent=2, default=str))
+    """Save job configurations to manifest."""
+    manifest = load_manifest()
+    state = load_state()
+
+    new_jobs = []
+    for key, job_data in jobs.items():
+        job_config = {
+            "name": job_data.get("name", ""),
+            "source": job_data.get("source", ""),
+        }
+
+        dest = job_data.get("dest", "")
+        if dest and dest != manifest.get("defaults", {}).get("dest"):
+            job_config["dest"] = dest
+
+        opts = job_data.get("options", {})
+
+        # New format fields
+        if "archive_format" in opts:
+            job_config["archive_format"] = opts["archive_format"]
+        elif opts.get("use_7z"):
+            job_config["archive_format"] = "7z"
+        elif opts.get("use_tar_gz"):
+            job_config["archive_format"] = "tar.gz"
+
+        if opts.get("use_restic"):
+            job_config["use_restic"] = True
+
+        if opts.get("op_vault"):
+            job_config["op_vault"] = opts["op_vault"]
+
+        new_jobs.append(job_config)
+
+        # Update state
+        job_state = state.get(key, {})
+        if job_data.get("last_runs"):
+            job_state["last_runs"] = job_data["last_runs"]
+        if opts.get("daemon_plist"):
+            job_state["daemon_plist"] = opts["daemon_plist"]
+        if job_state:
+            state[key] = job_state
+
+    manifest["jobs"] = new_jobs
+    save_manifest(manifest)
+    save_state(state)
 
 
 def get_job_key(source: Path) -> str:
     """Get a normalized key for a source path."""
     return str(source.expanduser().resolve())
+
+
+DEFAULT_MANIFEST: dict = {
+    "defaults": {
+        "dest": "~/Backups",
+        "archive_format": "7z",  # "7z", "tar.gz", or "" (disabled)
+        "use_restic": False,
+        "restic_interval_hours": 4,
+        "full_interval_days": 7,
+        "op_vault": "",
+    },
+    "jobs": [],
+}
+
+
+def _migrate_format_field(config: dict) -> dict:
+    """Migrate old 'format' field to 'archive_format' + 'use_restic'."""
+    if "format" not in config:
+        return config
+
+    old_format = config.pop("format")
+    if old_format == "hybrid":
+        config["archive_format"] = "7z"
+        config["use_restic"] = True
+    elif old_format == "restic":
+        config["archive_format"] = ""
+        config["use_restic"] = True
+    elif old_format in ("7z", "tar.gz"):
+        config["archive_format"] = old_format
+        config["use_restic"] = False
+    return config
+
+
+def load_manifest() -> dict:
+    """Load manifest configuration."""
+    if not MANIFEST_FILE.exists():
+        return DEFAULT_MANIFEST.copy()
+    try:
+        manifest = tomllib.loads(MANIFEST_FILE.read_text())
+
+        # Migrate old format field in defaults
+        if "defaults" in manifest:
+            manifest["defaults"] = _migrate_format_field(manifest["defaults"])
+
+        # Migrate old format field in each job
+        for job in manifest.get("jobs", []):
+            _migrate_format_field(job)
+
+        return manifest
+    except tomllib.TOMLDecodeError:
+        logger.warning(f"Failed to parse {MANIFEST_FILE}, using defaults")
+        return DEFAULT_MANIFEST.copy()
+
+
+def save_manifest(manifest: dict) -> None:
+    """Save manifest configuration."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_FILE.write_text(tomli_w.dumps(manifest))
+
+
+def resolve_job_config(job: dict, defaults: dict) -> dict:
+    """Resolve a job config by applying defaults for missing fields."""
+    resolved = defaults.copy()
+    resolved.update(job)
+    return resolved
+
+
+def load_state() -> dict:
+    """Load runtime state."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    """Save runtime state."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+
+def get_job_state(source: Path) -> dict:
+    """Get runtime state for a specific job."""
+    state = load_state()
+    key = get_job_key(source)
+    return state.get(key, {})
+
+
+def update_job_state(source: Path, **updates) -> None:
+    """Update runtime state for a job."""
+    state = load_state()
+    key = get_job_key(source)
+    if key not in state:
+        state[key] = {}
+    state[key].update(updates)
+    save_state(state)
+
+
+def migrate_jobs_json() -> bool:
+    """Migrate jobs.json to manifest.toml + state.json. Returns True if migration occurred."""
+    if not JOBS_FILE.exists():
+        return False
+    if MANIFEST_FILE.exists():
+        return False  # Already migrated
+
+    try:
+        old_jobs = json.loads(JOBS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    if not old_jobs:
+        return False
+
+    manifest = DEFAULT_MANIFEST.copy()
+    manifest["jobs"] = []
+    state: dict = {}
+
+    for key, job_data in old_jobs.items():
+        # Extract config fields
+        job_config = {
+            "name": job_data.get("name", ""),
+            "source": job_data.get("source", ""),
+        }
+
+        # Only add non-default values
+        if job_data.get("dest"):
+            job_config["dest"] = job_data["dest"]
+
+        opts = job_data.get("options", {})
+        if opts.get("use_restic"):
+            job_config["format"] = "restic"
+        elif opts.get("hybrid"):
+            job_config["format"] = "hybrid"
+        elif opts.get("use_7z") is False:
+            job_config["format"] = "tar.gz"
+        # else: inherits default "7z"
+
+        if opts.get("op_vault"):
+            job_config["op_vault"] = opts["op_vault"]
+        if opts.get("restic_interval_hours"):
+            job_config["restic_interval_hours"] = opts["restic_interval_hours"]
+        if opts.get("full_interval_days"):
+            job_config["full_interval_days"] = opts["full_interval_days"]
+
+        manifest["jobs"].append(job_config)
+
+        # Extract state fields
+        job_state = {}
+        if job_data.get("last_runs"):
+            job_state["last_runs"] = job_data["last_runs"]
+        if opts.get("daemon_plist"):
+            job_state["daemon_plist"] = opts["daemon_plist"]
+
+        if job_state:
+            state[key] = job_state
+
+    save_manifest(manifest)
+    if state:
+        save_state(state)
+
+    logger.info(f"Migrated {len(manifest['jobs'])} jobs from jobs.json")
+    return True
 
 
 def save_job_config(source: Path, dest: Path, name: str, **options) -> None:
@@ -135,13 +449,14 @@ def load_job_config(source: Path) -> dict | None:
 
 def update_job_last_run(source: Path, backup_type: str) -> None:
     """Update the last run timestamp for a job."""
-    jobs = load_jobs()
+    state = load_state()
     key = get_job_key(source)
-    if key in jobs:
-        if "last_runs" not in jobs[key]:
-            jobs[key]["last_runs"] = {}
-        jobs[key]["last_runs"][backup_type] = datetime.now().isoformat()
-        save_jobs(jobs)
+    if key not in state:
+        state[key] = {}
+    if "last_runs" not in state[key]:
+        state[key]["last_runs"] = {}
+    state[key]["last_runs"][backup_type] = datetime.now().isoformat()
+    save_state(state)
 
 
 # Default directories to exclude
@@ -200,16 +515,35 @@ DEFAULT_RESTIC_INTERVAL_HOURS = 4
 DEFAULT_FULL_INTERVAL_DAYS = 7
 
 
-def setup_logging(verbose: bool = False) -> None:
-    """Configure loguru logging."""
+def setup_logging(verbose: bool = False, file_logging: bool = False, console: bool = True) -> None:
+    """Configure loguru logging.
+
+    Args:
+        verbose: Enable DEBUG level logging
+        file_logging: Enable logging to ./logs/snapback.log with rotation
+        console: Enable console (stdout) logging - disable for TUI
+    """
     logger.remove()
-    level = "DEBUG" if verbose else "INFO"
-    logger.add(
-        sys.stdout,
-        format="<level>{message}</level>",
-        level=level,
-        colorize=True,
-    )
+
+    if console:
+        level = "DEBUG" if verbose else "INFO"
+        logger.add(
+            sys.stdout,
+            format="<level>{message}</level>",
+            level=level,
+            colorize=True,
+        )
+
+    if file_logging:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            LOGS_DIR / "snapback.log",
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+            level="DEBUG",  # Always capture debug in file
+            rotation="10 MB",
+            retention=5,
+            compression="gz",
+        )
 
 
 @dataclass
@@ -220,11 +554,16 @@ class BackupConfig:
     name: str
     exclude_dirs: list[str] = field(default_factory=list)
     include_git_in_restic: bool = True  # .git deduplicates well in restic
-    exclude_git_in_full: bool = True    # Exclude .git from tar.gz (large)
+    exclude_git_in_full: bool = True    # Exclude .git from archive (large)
     restic_interval_hours: int = DEFAULT_RESTIC_INTERVAL_HOURS
     full_interval_days: int = DEFAULT_FULL_INTERVAL_DAYS
     split_size: str | None = None  # e.g., "1g", "500m" - None means no splitting
-    use_7z: bool = False  # Use 7z format instead of tar.gz
+    archive_format: str = ArchiveFormat.SEVENZ.value  # "7z", "tar.gz", or "" (disabled)
+
+    @property
+    def use_7z(self) -> bool:
+        """Backward-compat property."""
+        return self.archive_format == ArchiveFormat.SEVENZ.value
 
     @property
     def backup_prefix(self) -> str:
@@ -1127,7 +1466,7 @@ def get_password_from_1password(name: str, vault: str | None = None) -> str | No
     item_title = f"Snapback: {name} restic password"
     use_vault = vault or _1password_vault
 
-    cmd = ["op", "item", "get", item_title, "--fields", "password"]
+    cmd = ["op", "item", "get", item_title, "--fields", "password", "--reveal"]
     if use_vault:
         cmd.extend(["--vault", use_vault])
 
@@ -1256,11 +1595,11 @@ def create_7z_backup(dry_run: bool = False) -> Path | None:
     return None
 
 
-def run_hybrid_backup(force: bool, auto: bool, dry_run: bool) -> int:
+def run_combined_backup(force: bool, auto: bool, dry_run: bool) -> int:
     """
-    Hybrid backup mode:
+    Combined backup mode (restic + archive):
     - Run restic backup if > restic_interval_hours since last restic backup
-    - Run full tar.gz backup if > full_interval_days since last full backup
+    - Run full archive backup if > full_interval_days since last full backup
     """
     assert _config is not None
     restic_ran = False
@@ -1299,7 +1638,7 @@ def run_hybrid_backup(force: bool, auto: bool, dry_run: bool) -> int:
         return 0
 
     if not restic_needed and not full_needed:
-        logger.success(f"All backups are current (restic < {_config.restic_interval_hours}h, full < {_config.full_interval_days}d)")
+        logger.success(f"All backups are current (restic < {_config.restic_interval_hours}h, archive < {_config.full_interval_days}d)")
         return 0
 
     if restic_needed:
@@ -1308,32 +1647,37 @@ def run_hybrid_backup(force: bool, auto: bool, dry_run: bool) -> int:
         else:
             if create_restic_backup(dry_run=False):
                 restic_ran = True
+                # Update timestamp immediately on success
+                update_job_last_run(_config.source_dir, "restic")
             else:
                 logger.error("Restic backup failed")
 
     if full_needed:
-        backup_format = "7z" if _config.use_7z else "tar.gz"
+        archive_fmt = _config.archive_format
         if dry_run:
-            logger.info(f"[DRY RUN] Would run full {backup_format} backup (every {_config.full_interval_days} days)")
+            logger.info(f"[DRY RUN] Would run full {archive_fmt} backup (every {_config.full_interval_days} days)")
         else:
-            logger.info(f"Running full {backup_format} backup (every {_config.full_interval_days} days)...")
-            if _config.use_7z:
+            logger.info(f"Running full {archive_fmt} backup (every {_config.full_interval_days} days)...")
+            if archive_fmt == ArchiveFormat.SEVENZ.value:
                 backup_result = create_7z_backup(dry_run=False)
             else:
                 backup_result = create_backup(dry_run=False)
             if backup_result:
                 full_ran = True
+                # Update timestamp immediately on success
+                update_job_last_run(_config.source_dir, archive_fmt)
             else:
                 logger.error("Full backup failed")
 
     if dry_run:
         return 0
 
-    if restic_needed and not restic_ran:
-        return 1
-    if full_needed and not full_ran:
-        return 1
-    return 0
+    # Return partial success (0) if at least one backup ran
+    if restic_ran or full_ran:
+        if (restic_needed and not restic_ran) or (full_needed and not full_ran):
+            return 2  # Partial success
+        return 0
+    return 1
 
 
 # =============================================================================
@@ -1461,39 +1805,39 @@ def find_snapback_path() -> str:
 # =============================================================================
 
 @click.group(invoke_without_command=True)
-@click.option("--source", "-s", type=click.Path(exists=True, path_type=Path), help="Source directory to backup")
-@click.option("--dest", "-d", type=click.Path(path_type=Path), help="Destination directory for backups")
-@click.option("--name", "-N", help="Name for this backup (used in filenames)")
-@click.option("--restic", is_flag=True, help="Use restic incremental backup")
-@click.option("--hybrid", is_flag=True, help="Hybrid mode: restic + full tar.gz")
+@click.option(CLIFlags.SOURCE, "-s", type=click.Path(exists=True, path_type=Path), help="Source directory to backup")
+@click.option(CLIFlags.DEST, "-d", type=click.Path(path_type=Path), help="Destination directory for backups")
+@click.option(CLIFlags.NAME, "-N", help="Name for this backup (used in filenames)")
+@click.option(CLIFlags.RESTIC + "/" + CLIFlags.NO_RESTIC, default=False, help="Enable/disable restic incremental backup")
+@click.option(CLIFlags.ARCHIVE_FORMAT, type=click.Choice(["7z", "tar.gz", "none"]), default="7z",
+              help="Archive format for full backups (default: 7z)")
 @click.option("--exclude", "-e", multiple=True, help="Additional directories to exclude")
 @click.option("--no-default-excludes", is_flag=True, help="Don't use default exclusions")
-@click.option("--include-git", is_flag=True, help="Include .git in tar.gz backups")
+@click.option("--include-git", is_flag=True, help="Include .git in archive backups")
 @click.option("--exclude-git-restic", is_flag=True, help="Exclude .git from restic backups")
-@click.option("--force", "-f", is_flag=True, help="Skip recency check and create backup")
-@click.option("--auto", "-a", is_flag=True, help="Automatic mode: skip silently if not needed")
+@click.option(CLIFlags.FORCE, "-f", is_flag=True, help="Skip recency check and create backup")
+@click.option(CLIFlags.AUTO, "-a", is_flag=True, help="Automatic mode: skip silently if not needed")
 @click.option("--dry-run", "-n", is_flag=True, help="Show what would happen without doing it")
 @click.option("--list", "-l", "list_mode", is_flag=True, help="List existing backups")
 @click.option("--notify", is_flag=True, help="Send macOS notifications")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--restic-interval", type=int, default=DEFAULT_RESTIC_INTERVAL_HOURS,
+@click.option(CLIFlags.RESTIC_INTERVAL, type=int, default=DEFAULT_RESTIC_INTERVAL_HOURS,
               help=f"Hours between restic backups (default: {DEFAULT_RESTIC_INTERVAL_HOURS})")
-@click.option("--full-interval", type=int, default=DEFAULT_FULL_INTERVAL_DAYS,
-              help=f"Days between full tar.gz backups (default: {DEFAULT_FULL_INTERVAL_DAYS})")
-@click.option("--7z/--tar-gz", "use_7z", default=True, help="Use 7z (default) or tar.gz format")
+@click.option(CLIFlags.FULL_INTERVAL, type=int, default=DEFAULT_FULL_INTERVAL_DAYS,
+              help=f"Days between full archive backups (default: {DEFAULT_FULL_INTERVAL_DAYS})")
 @click.option("--split-size", type=str, default="50m",
               help="Split backup into volumes of this size (default: 50m). Use --no-split to disable")
 @click.option("--no-split", is_flag=True, help="Don't split backup into volumes")
 @click.option("--save", is_flag=True, help="Save this job config for future runs (auto-saved on successful backup)")
 @click.option("--1password", "use_1password", is_flag=True, help="Store restic password in 1Password")
-@click.option("--1password-vault", "op_vault", type=str, help="1Password vault name (prompts interactively if not specified)")
+@click.option(CLIFlags.ONEPASSWORD_VAULT, "op_vault", type=str, help="1Password vault name (prompts interactively if not specified)")
 @click.version_option(version=__version__)
 @click.pass_context
-def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
+def cli(ctx, source, dest, name, restic, archive_format, exclude, no_default_excludes,
         include_git, exclude_git_restic, force, auto, dry_run, list_mode, notify, verbose,
-        restic_interval, full_interval, use_7z, split_size, no_split, save,
+        restic_interval, full_interval, split_size, no_split, save,
         use_1password, op_vault):
-    """Snapback - Hybrid backup tool with tar.gz and restic support.
+    """Snapback - Backup tool with archive (7z/tar.gz) and restic support.
 
     Run with just --source to use saved config from a previous run.
     """
@@ -1515,19 +1859,17 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
             name = saved["name"]
             opts = saved.get("options", {})
             # Apply saved options (CLI flags override saved)
-            if not hybrid and opts.get("hybrid"):
-                hybrid = True
-            if not restic and opts.get("restic"):
+            if not restic and opts.get("use_restic"):
                 restic = True
-            if use_7z and "use_7z" in opts:
-                use_7z = opts["use_7z"]
+            if archive_format == "7z" and opts.get("archive_format"):
+                archive_format = opts["archive_format"]
             if split_size == "50m" and opts.get("split_size"):
                 split_size = opts["split_size"]
             if not no_split and opts.get("no_split"):
                 no_split = True
             logger.debug(f"  dest: {dest}")
             logger.debug(f"  name: {name}")
-            logger.debug(f"  hybrid: {hybrid}, restic: {restic}")
+            logger.debug(f"  restic: {restic}, archive_format: {archive_format}")
         else:
             raise click.UsageError(
                 f"No saved config for {source}. "
@@ -1548,6 +1890,10 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     # Determine effective split size
     effective_split_size = None if no_split else split_size
 
+    # Normalize archive_format
+    if archive_format == "none":
+        archive_format = ArchiveFormat.NONE.value
+
     # Set up global config
     global _config
     _config = BackupConfig(
@@ -1560,14 +1906,14 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
         restic_interval_hours=restic_interval,
         full_interval_days=full_interval,
         split_size=effective_split_size,
-        use_7z=use_7z,
+        archive_format=archive_format,
     )
 
     # Check if 7z is installed when using 7z format
-    if use_7z and not check_7z_installed():
+    if archive_format == ArchiveFormat.SEVENZ.value and not check_7z_installed():
         raise click.ClickException(
             "7z is not installed. Install with: brew install p7zip\n"
-            "Or use --tar-gz to use tar.gz format instead."
+            f"Or use {CLIFlags.ARCHIVE_FORMAT} tar.gz instead."
         )
 
     # Enable notifications
@@ -1620,21 +1966,20 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     if not dry_run:
         ensure_backup_dir()
 
-    # Hybrid mode
-    if hybrid:
-        result = run_hybrid_backup(force, auto, dry_run)
-        # Save config on successful hybrid backup
-        if result == 0 and not dry_run:
+    # Combined restic + archive mode (replaces old "hybrid" mode)
+    if restic and archive_format and archive_format != ArchiveFormat.NONE.value:
+        result = run_combined_backup(force, auto, dry_run)
+        # Save config on any successful backup (0=full success, 2=partial success)
+        if result in (0, 2) and not dry_run:
             save_job_config(
                 source, dest, name,
-                hybrid=True,
-                restic=False,
-                use_7z=use_7z,
+                use_restic=True,
+                archive_format=archive_format,
                 split_size=effective_split_size,
                 no_split=no_split,
             )
-            update_job_last_run(source, "hybrid")
-        ctx.exit(result)
+            # Timestamps are updated inside run_combined_backup now
+        ctx.exit(0 if result in (0, 2) else 1)
 
     # Check for recent backup
     if restic:
@@ -1642,7 +1987,7 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
         backup_type = "restic"
     else:
         last_backup = get_last_backup_time()
-        backup_type = "7z" if use_7z else "tar.gz"
+        backup_type = archive_format if archive_format else "archive"
 
     if last_backup:
         age = datetime.now() - last_backup
@@ -1668,12 +2013,14 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     if restic:
         result = create_restic_backup(dry_run=dry_run)
         backup_type_for_save = "restic"
-    elif use_7z:
+    elif archive_format == ArchiveFormat.SEVENZ.value:
         result = create_7z_backup(dry_run=dry_run)
         backup_type_for_save = "7z"
-    else:
+    elif archive_format == ArchiveFormat.TAR_GZ.value:
         result = create_backup(dry_run=dry_run)
         backup_type_for_save = "tar.gz"
+    else:
+        raise click.ClickException("Must specify either --restic or --archive-format")
 
     if dry_run:
         ctx.exit(0)
@@ -1682,15 +2029,973 @@ def cli(ctx, source, dest, name, restic, hybrid, exclude, no_default_excludes,
     if result:
         save_job_config(
             source, dest, name,
-            hybrid=hybrid,
-            restic=restic,
-            use_7z=use_7z,
+            use_restic=restic,
+            archive_format=archive_format,
             split_size=effective_split_size,
             no_split=no_split,
         )
         update_job_last_run(source, backup_type_for_save)
 
     ctx.exit(0 if result else 1)
+
+
+class ConfirmModal(ModalScreen):
+    """Modal for confirmation dialogs."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    CSS = """
+    ConfirmModal {
+        align: center middle;
+    }
+
+    #confirm-dialog {
+        width: 50;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $error;
+    }
+
+    #confirm-buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #confirm-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self.message)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Yes", variant="error", id="yes-btn")
+                yield Button("No", variant="primary", id="no-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes-btn")
+
+
+class PlistModal(ModalScreen):
+    """Modal for viewing plist content with syntax highlighting."""
+
+    BINDINGS = [Binding("escape", "dismiss_modal", "Close", show=False)]
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss()
+
+    CSS = """
+    PlistModal {
+        align: center middle;
+    }
+
+    #plist-dialog {
+        width: 95%;
+        height: 90%;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #plist-scroll {
+        height: 1fr;
+        overflow-y: auto;
+        overflow-x: auto;
+    }
+
+    #plist-buttons {
+        margin-top: 1;
+        align: center middle;
+        height: auto;
+    }
+    """
+
+    def __init__(self, title: str, content: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.content = content
+
+    def compose(self) -> ComposeResult:
+        from rich.syntax import Syntax
+
+        with Vertical(id="plist-dialog"):
+            yield Label(f"[bold]{self.title_text}[/bold]", markup=True)
+            with ScrollableContainer(id="plist-scroll"):
+                syntax = Syntax(self.content, "xml", theme="monokai", line_numbers=True)
+                yield Static(syntax)
+            with Horizontal(id="plist-buttons"):
+                yield Button("Close", variant="primary", id="close-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss()
+
+
+class HistoryModal(ModalScreen):
+    """Modal for viewing backup history."""
+
+    BINDINGS = [Binding("escape", "dismiss_modal", "Close", show=False)]
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss()
+
+    CSS = """
+    HistoryModal {
+        align: center middle;
+    }
+
+    #history-dialog {
+        width: 95%;
+        height: 90%;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #history-scroll {
+        height: 1fr;
+        overflow-y: auto;
+    }
+
+    #history-buttons {
+        margin-top: 1;
+        align: center middle;
+        height: auto;
+    }
+    """
+
+    def __init__(self, name: str, dest: Path, source: Path) -> None:
+        super().__init__()
+        self.job_name = name
+        self.dest = dest
+        self.source = source
+
+    def compose(self) -> ComposeResult:
+        from rich.table import Table
+        from rich.text import Text
+
+        content_parts = []
+
+        # Get restic snapshots
+        restic_dir = self.dest / self.job_name / "restic"
+        password_file = Path.home() / ".config/restic" / f"{self.job_name}-password"
+
+        if restic_dir.exists() and password_file.exists():
+            try:
+                result = subprocess.run(
+                    ["restic", "-r", str(restic_dir), "snapshots", "--json"],
+                    capture_output=True, text=True,
+                    env={**os.environ, "RESTIC_PASSWORD_FILE": str(password_file)}
+                )
+                if result.returncode == 0:
+                    import json
+                    snapshots = json.loads(result.stdout)
+                    if snapshots:
+                        content_parts.append("[bold cyan]═══ Restic Snapshots ═══[/bold cyan]\n")
+                        for snap in sorted(snapshots, key=lambda x: x.get("time", ""), reverse=True)[:20]:
+                            time_str = snap.get("time", "")[:19].replace("T", " ")
+                            short_id = snap.get("short_id", "")
+                            hostname = snap.get("hostname", "")
+                            content_parts.append(f"  [green]{short_id}[/green]  {time_str}  [dim]{hostname}[/dim]\n")
+                        content_parts.append("\n")
+            except Exception:
+                pass
+
+        # Get archive files
+        archive_patterns = [f"{self.job_name}_*.7z", f"{self.job_name}_*.7z.001", f"{self.job_name}_*.tar.gz"]
+        archives = []
+        for pattern in archive_patterns:
+            archives.extend(self.dest.glob(pattern))
+
+        if archives:
+            content_parts.append("[bold yellow]═══ Archive Backups ═══[/bold yellow]\n")
+            # Sort by modification time, newest first
+            for archive in sorted(archives, key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+                mtime = datetime.fromtimestamp(archive.stat().st_mtime)
+                size_mb = archive.stat().st_size / (1024 * 1024)
+                content_parts.append(f"  [yellow]{archive.name}[/yellow]\n")
+                content_parts.append(f"    {mtime.strftime('%Y-%m-%d %H:%M')}  [dim]{size_mb:.1f} MB[/dim]\n")
+            content_parts.append("\n")
+
+        if not content_parts:
+            content_parts.append("[dim]No backup history found[/dim]")
+
+        content = "".join(content_parts)
+
+        with Vertical(id="history-dialog"):
+            yield Label(f"[bold]History: {self.job_name}[/bold]", markup=True)
+            with ScrollableContainer(id="history-scroll"):
+                yield Static(content, markup=True)
+            with Horizontal(id="history-buttons"):
+                yield Button("Close", variant="primary", id="close-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss()
+
+
+class EditJobModal(ModalScreen):
+    """Modal for editing a job."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    CSS = """
+    EditJobModal {
+        align: center middle;
+    }
+
+    #edit-dialog {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #edit-dialog Label {
+        margin-top: 1;
+    }
+
+    #edit-dialog Input {
+        margin-bottom: 1;
+    }
+
+    #buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, job: dict | None = None, defaults: dict | None = None) -> None:
+        super().__init__()
+        self.job = job or {}
+        self.defaults = defaults or {}
+        self.is_new = job is None
+
+    def compose(self) -> ComposeResult:
+        resolved = resolve_job_config(self.job, self.defaults) if self.job else self.defaults
+
+        with Vertical(id="edit-dialog"):
+            yield Label("Name:")
+            yield Input(value=self.job.get("name", ""), id="name-input", placeholder="job-name")
+
+            yield Label("Source:")
+            yield Input(value=self.job.get("source", ""), id="source-input", placeholder="~/path/to/source")
+
+            dest_value = self.job.get("dest", "")
+            default_dest = self.defaults.get("dest", "~/Backups")
+            dest_inherited = " [dim](inherited)[/dim]" if not dest_value else ""
+            yield Label(f"Dest:{dest_inherited}", id="dest-label", markup=True)
+            yield Input(value=dest_value, id="dest-input", placeholder=default_dest)
+
+            yield Static("─── Full Backups ───")
+            yield Label("Archive Format:")
+            with RadioSet(id="archive-format-radio"):
+                current_archive = resolved.get("archive_format", "7z")
+                yield RadioButton("None", value=current_archive == "")
+                yield RadioButton("7z", value=current_archive == "7z")
+                yield RadioButton("tar.gz", value=current_archive == "tar.gz")
+
+            # Full interval - only show job override, not resolved value
+            full_interval_value = self.job.get("full_interval_days", "")
+            default_full = self.defaults.get("full_interval_days", 7)
+            full_inherited = " [dim](inherited)[/dim]" if not full_interval_value else ""
+            yield Label(f"Full Backup Interval (days):{full_inherited}", id="full-interval-label", markup=True)
+            yield Input(
+                value=str(full_interval_value) if full_interval_value else "",
+                id="full-interval-input",
+                placeholder=str(default_full)
+            )
+
+            yield Static("─── Incremental ───")
+            yield Checkbox("Enable restic", value=resolved.get("use_restic", False), id="use-restic-checkbox")
+
+            # Restic interval - only show job override, not resolved value
+            restic_interval_value = self.job.get("restic_interval_hours", "")
+            default_restic = self.defaults.get("restic_interval_hours", 4)
+            restic_inherited = " [dim](inherited)[/dim]" if not restic_interval_value else ""
+            yield Label(f"Restic Interval (hours):{restic_inherited}", id="restic-interval-label", markup=True)
+            yield Input(
+                value=str(restic_interval_value) if restic_interval_value else "",
+                id="restic-interval-input",
+                placeholder=str(default_restic)
+            )
+
+            op_vault_value = self.job.get("op_vault", "")
+            default_vault = self.defaults.get("op_vault", "")
+            vault_inherited = " [dim](inherited)[/dim]" if not op_vault_value and default_vault else ""
+            yield Label(f"1Password Vault:{vault_inherited}", id="op-vault-label", markup=True)
+            yield Input(value=op_vault_value, id="op-vault-input", placeholder=default_vault if default_vault else "")
+
+            with Horizontal(id="buttons"):
+                yield Button("Save", variant="primary", id="save-btn")
+                yield Button("Cancel", id="cancel-btn")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Update label to remove (inherited) when user types."""
+        label_map = {
+            "dest-input": ("dest-label", "Dest:"),
+            "full-interval-input": ("full-interval-label", "Full Backup Interval (days):"),
+            "restic-interval-input": ("restic-interval-label", "Restic Interval (hours):"),
+            "op-vault-input": ("op-vault-label", "1Password Vault:"),
+        }
+        if event.input.id in label_map:
+            label_id, base_text = label_map[event.input.id]
+            label = self.query_one(f"#{label_id}", Label)
+            if event.value:
+                label.update(base_text)
+            else:
+                label.update(f"{base_text} [dim](inherited)[/dim]")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-btn":
+            name = self.query_one("#name-input", Input).value.strip()
+            source = self.query_one("#source-input", Input).value.strip()
+            dest = self.query_one("#dest-input", Input).value.strip()
+            op_vault = self.query_one("#op-vault-input", Input).value.strip()
+
+            archive_radio = self.query_one("#archive-format-radio", RadioSet)
+            archive_map = {0: "", 1: "7z", 2: "tar.gz"}
+            archive_format = archive_map.get(archive_radio.pressed_index, "7z")
+
+            use_restic = self.query_one("#use-restic-checkbox", Checkbox).value
+
+            # Get interval values
+            full_interval_str = self.query_one("#full-interval-input", Input).value.strip()
+            restic_interval_str = self.query_one("#restic-interval-input", Input).value.strip()
+
+            if not name or not source:
+                self.notify("Name and source are required", severity="error")
+                return
+
+            if not archive_format and not use_restic:
+                self.notify("Must enable at least one backup method", severity="error")
+                return
+
+            new_job = {"name": name, "source": source}
+            # Only save overrides when different from defaults
+            default_dest = self.defaults.get("dest", "")
+            if dest and dest != default_dest:
+                new_job["dest"] = dest
+            if archive_format != self.defaults.get("archive_format", "7z"):
+                new_job["archive_format"] = archive_format
+            if use_restic != self.defaults.get("use_restic", False):
+                new_job["use_restic"] = use_restic
+            default_vault = self.defaults.get("op_vault", "")
+            if op_vault and op_vault != default_vault:
+                new_job["op_vault"] = op_vault
+
+            # Only save intervals if explicitly set and different from defaults
+            if full_interval_str:
+                try:
+                    full_interval = int(full_interval_str)
+                    if full_interval != self.defaults.get("full_interval_days", 7):
+                        new_job["full_interval_days"] = full_interval
+                except ValueError:
+                    self.notify("Full interval must be a number", severity="error")
+                    return
+
+            if restic_interval_str:
+                try:
+                    restic_interval = int(restic_interval_str)
+                    if restic_interval != self.defaults.get("restic_interval_hours", 4):
+                        new_job["restic_interval_hours"] = restic_interval
+                except ValueError:
+                    self.notify("Restic interval must be a number", severity="error")
+                    return
+
+            self.dismiss(new_job)
+        else:
+            self.dismiss(None)
+
+
+class EditDefaultsModal(ModalScreen):
+    """Modal for editing defaults."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    CSS = """
+    EditDefaultsModal {
+        align: center middle;
+    }
+
+    #defaults-dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #defaults-dialog Label {
+        margin-top: 1;
+    }
+
+    #defaults-dialog Input {
+        margin-bottom: 1;
+    }
+
+    #defaults-buttons {
+        margin-top: 2;
+        align: center middle;
+    }
+
+    #defaults-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, defaults: dict) -> None:
+        super().__init__()
+        self.defaults = defaults
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="defaults-dialog"):
+            yield Label("Default Destination:")
+            yield Input(value=self.defaults.get("dest", "~/Backups"), id="dest-input")
+
+            yield Static("─── Full Backups ───")
+            yield Label("Archive Format:")
+            with RadioSet(id="archive-format-radio"):
+                current_archive = self.defaults.get("archive_format", "7z")
+                yield RadioButton("None", value=current_archive == "")
+                yield RadioButton("7z", value=current_archive == "7z")
+                yield RadioButton("tar.gz", value=current_archive == "tar.gz")
+
+            yield Label("Full Backup Interval (days):")
+            yield Input(value=str(self.defaults.get("full_interval_days", 7)), id="full-interval-input")
+
+            yield Static("─── Incremental ───")
+            yield Checkbox("Enable restic", value=self.defaults.get("use_restic", False), id="use-restic-checkbox")
+
+            yield Label("Restic Interval (hours):")
+            yield Input(value=str(self.defaults.get("restic_interval_hours", 4)), id="restic-interval-input")
+
+            yield Label("1Password Vault (optional):")
+            yield Input(value=self.defaults.get("op_vault", ""), id="op-vault-input", placeholder="Vault name for restic passwords")
+
+            with Horizontal(id="defaults-buttons"):
+                yield Button("Save", variant="primary", id="save-btn")
+                yield Button("Cancel", id="cancel-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-btn":
+            dest = self.query_one("#dest-input", Input).value.strip()
+            restic_interval = self.query_one("#restic-interval-input", Input).value.strip()
+            full_interval = self.query_one("#full-interval-input", Input).value.strip()
+            op_vault = self.query_one("#op-vault-input", Input).value.strip()
+
+            archive_radio = self.query_one("#archive-format-radio", RadioSet)
+            archive_map = {0: "", 1: "7z", 2: "tar.gz"}
+            archive_format = archive_map.get(archive_radio.pressed_index, "7z")
+
+            use_restic = self.query_one("#use-restic-checkbox", Checkbox).value
+
+            try:
+                restic_hours = int(restic_interval)
+                full_days = int(full_interval)
+            except ValueError:
+                self.notify("Intervals must be integers", severity="error")
+                return
+
+            new_defaults = {
+                "dest": dest or "~/Backups",
+                "archive_format": archive_format,
+                "use_restic": use_restic,
+                "restic_interval_hours": restic_hours,
+                "full_interval_days": full_days,
+                "op_vault": op_vault,
+            }
+
+            self.dismiss(new_defaults)
+        else:
+            self.dismiss(None)
+
+
+class SnapbackApp(App):
+    """Textual app for managing snapback jobs."""
+
+    TITLE = "Snapback"
+    SUB_TITLE = "Backup Configuration"
+
+    CSS = """
+    Screen {
+        align: center middle;
+    }
+
+    #jobs-table {
+        height: 1fr;
+        margin: 1 2;
+    }
+
+    Footer {
+        background: $primary-background;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("a", "add_job", "Add"),
+        Binding("e", "edit_job", "Edit"),
+        Binding("d", "delete_job", "Delete"),
+        Binding("i", "install_daemon", "Install"),
+        Binding("u", "uninstall_daemon", "Uninstall"),
+        Binding("r", "run_now", "Run"),
+        Binding("s", "edit_defaults", "Defaults"),
+        Binding("p", "view_plist", "Plist"),
+        Binding("h", "view_history", "History"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._running_backups: set[str] = set()  # Track multiple concurrent backups
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="jobs-table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("NAME", "SOURCE", "DEST", "FORMAT", "DAEMON", "LAST RUN")
+        self.refresh_jobs()
+
+    def refresh_jobs(self) -> None:
+        """Refresh the jobs table from manifest."""
+        table = self.query_one(DataTable)
+        table.clear()
+
+        manifest = load_manifest()
+        state = load_state()
+        defaults = manifest.get("defaults", {})
+
+        for job in manifest.get("jobs", []):
+            resolved = resolve_job_config(job, defaults)
+            source = job.get("source", "")
+            key = get_job_key(Path(source)) if source else ""
+            job_state = state.get(key, {})
+
+            # Daemon status
+            daemon_plist = job_state.get("daemon_plist", "")
+            daemon_status = "●" if daemon_plist and Path(daemon_plist).exists() else "○"
+
+            # Last run - show running indicator if this job is currently running
+            job_name = resolved.get("name", "")
+            if job_name in self._running_backups:
+                last_run = "⏳ running..."
+            else:
+                last_runs = job_state.get("last_runs", {})
+                last_run = "never"
+                if last_runs:
+                    latest = max(last_runs.values())
+                    try:
+                        dt = datetime.fromisoformat(latest)
+                        delta = datetime.now() - dt
+                        if delta.days > 0:
+                            last_run = f"{delta.days}d ago"
+                        elif delta.seconds >= 3600:
+                            last_run = f"{delta.seconds // 3600}h ago"
+                        else:
+                            last_run = f"{delta.seconds // 60}m ago"
+                    except ValueError:
+                        last_run = latest
+
+            # Build format display
+            archive_fmt = resolved.get("archive_format", "")
+            use_restic = resolved.get("use_restic", False)
+            if archive_fmt and use_restic:
+                format_display = f"{archive_fmt}+restic"
+            elif archive_fmt:
+                format_display = archive_fmt
+            elif use_restic:
+                format_display = "restic"
+            else:
+                format_display = "none"
+
+            # Shorten paths by replacing home dir with ~
+            home = str(Path.home())
+            display_source = source.replace(home, "~") if source.startswith(home) else source
+            display_dest = resolved.get("dest", "").replace(home, "~")
+
+            table.add_row(
+                resolved.get("name", ""),
+                display_source,
+                display_dest,
+                format_display,
+                daemon_status,
+                last_run,
+            )
+
+    def action_quit(self) -> None:
+        self.exit()
+
+    def action_add_job(self) -> None:
+        manifest = load_manifest()
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditJobModal(job=None, defaults=defaults), self._on_job_edited)
+
+    def action_edit_job(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditJobModal(job=job, defaults=defaults), self._on_job_edited)
+
+    def _on_job_edited(self, result: dict | None) -> None:
+        if result is None:
+            logger.debug("TUI: Job edit cancelled")
+            return
+
+        manifest = load_manifest()
+
+        # Check if editing existing or adding new
+        existing_idx = None
+        for i, job in enumerate(manifest.get("jobs", [])):
+            if job.get("name") == result.get("name"):
+                existing_idx = i
+                break
+
+        job_name = result.get('name', 'unknown')
+        if existing_idx is not None:
+            manifest["jobs"][existing_idx] = result
+            logger.info(f"TUI: Updated job '{job_name}': {result}")
+        else:
+            if "jobs" not in manifest:
+                manifest["jobs"] = []
+            manifest["jobs"].append(result)
+            logger.info(f"TUI: Added new job '{job_name}': {result}")
+
+        save_manifest(manifest)
+        self.refresh_jobs()
+        self.notify(f"Saved job: {job_name}")
+
+    def action_delete_job(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        job_name = job.get("name", "unknown")
+
+        self.push_screen(
+            ConfirmModal(f"Delete job '{job_name}'?"),
+            lambda result: self._on_delete_confirmed(result, table.cursor_row)
+        )
+
+    def _on_delete_confirmed(self, confirmed: bool, index: int) -> None:
+        if not confirmed:
+            logger.debug("TUI: Job deletion cancelled")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if index < len(jobs):
+            deleted = jobs.pop(index)
+            manifest["jobs"] = jobs
+            save_manifest(manifest)
+            self.refresh_jobs()
+            job_name = deleted.get('name', 'unknown')
+            logger.info(f"TUI: Deleted job '{job_name}'")
+            self.notify(f"Deleted job: {job_name}")
+
+    def action_install_daemon(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        resolved = resolve_job_config(job, defaults)
+
+        source = Path(resolved.get("source", "")).expanduser()
+        dest = Path(resolved.get("dest", "")).expanduser()
+        name = resolved.get("name", "")
+
+        if not source.exists():
+            self.notify(f"Source does not exist: {source}", severity="error")
+            return
+
+        # Call the daemon install logic
+        try:
+            archive_format = resolved.get("archive_format", ArchiveFormat.SEVENZ.value)
+            use_restic = resolved.get("use_restic", False)
+            op_vault = resolved.get("op_vault")
+
+            self.notify(f"Installing daemon for {name}...")
+            # Capture values to avoid closure issues
+            self.call_later(
+                lambda s=source, d=dest, n=name, r=use_restic, a=archive_format, o=op_vault:
+                    self._do_daemon_install(s, d, n, r, a, o)
+            )
+        except Exception as e:
+            self.notify(f"Failed to install daemon: {e}", severity="error")
+
+    def _do_daemon_install(self, source: Path, dest: Path, name: str,
+                           use_restic: bool, archive_format: str, op_vault: str | None) -> None:
+        """Run daemon install in background."""
+        logger.info(f"TUI: Installing daemon for '{name}'")
+        cmd = [
+            sys.executable, __file__, "daemon", "install",
+            CLIFlags.SOURCE, str(source),
+            CLIFlags.DEST, str(dest),
+            CLIFlags.NAME, name,
+        ]
+        if use_restic:
+            cmd.append(CLIFlags.RESTIC)
+        else:
+            cmd.append(CLIFlags.NO_RESTIC)
+        if archive_format and archive_format != ArchiveFormat.NONE.value:
+            cmd.extend([CLIFlags.ARCHIVE_FORMAT, archive_format])
+        else:
+            cmd.extend([CLIFlags.ARCHIVE_FORMAT, "none"])
+        if op_vault:
+            cmd.extend([CLIFlags.ONEPASSWORD_VAULT, op_vault])
+
+        logger.debug(f"TUI: Daemon install command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            logger.info(f"TUI: Daemon installed successfully for '{name}'")
+            self.notify(f"Daemon installed for {name}")
+        else:
+            logger.error(f"TUI: Daemon install failed for '{name}': {result.stderr}")
+            self.notify(f"Daemon install failed. See logs/snapback.log", severity="error")
+
+        self.refresh_jobs()
+
+    def action_uninstall_daemon(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        name = job.get("name", "")
+
+        self.push_screen(
+            ConfirmModal(f"Uninstall daemon for '{name}'?"),
+            lambda result: self._on_uninstall_confirmed(result, name)
+        )
+
+    def _on_uninstall_confirmed(self, confirmed: bool, name: str) -> None:
+        if not confirmed:
+            logger.debug(f"TUI: Daemon uninstall cancelled for '{name}'")
+            return
+
+        logger.info(f"TUI: Uninstalling daemon for '{name}'")
+        import subprocess
+
+        cmd = [sys.executable, __file__, "daemon", "uninstall", "--name", name]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            logger.info(f"TUI: Daemon uninstalled successfully for '{name}'")
+            self.notify(f"Daemon uninstalled for {name}")
+        else:
+            logger.error(f"TUI: Daemon uninstall failed for '{name}': {result.stderr}")
+            self.notify(f"Uninstall failed. See logs/snapback.log", severity="error")
+
+        self.refresh_jobs()
+
+    def action_run_now(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        resolved = resolve_job_config(job, defaults)
+
+        name = resolved.get("name", "")
+        self._running_backups.add(name)
+        self.refresh_jobs()  # Show "running..." indicator immediately
+        self.notify(f"Running backup for {name}...", timeout=10)
+        self._run_backup_worker(resolved)
+
+    @work(thread=True)  # Allow multiple concurrent backups
+    def _run_backup_worker(self, job: dict) -> None:
+        """Run backup in background thread."""
+        import traceback
+        name = job.get("name", "unknown")
+        try:
+            source = Path(job.get("source", "")).expanduser()
+            dest = Path(job.get("dest", "")).expanduser()
+            archive_format = job.get("archive_format", ArchiveFormat.SEVENZ.value)
+            use_restic = job.get("use_restic", False)
+
+            logger.info(f"TUI: Starting backup for job '{name}'")
+            logger.debug(f"TUI: Job config: source={source}, dest={dest}, archive_format={archive_format}, use_restic={use_restic}")
+
+            cmd = [
+                sys.executable, __file__,
+                CLIFlags.SOURCE, str(source),
+                CLIFlags.DEST, str(dest),
+                CLIFlags.NAME, name,
+                CLIFlags.FORCE,  # Skip recency prompt - user explicitly clicked Run
+            ]
+
+            # Add format flags using new schema
+            if use_restic:
+                cmd.append(CLIFlags.RESTIC)
+            if archive_format and archive_format != ArchiveFormat.NONE.value:
+                cmd.extend([CLIFlags.ARCHIVE_FORMAT, archive_format])
+            else:
+                # Explicitly disable archive when not wanted (CLI defaults to 7z)
+                cmd.extend([CLIFlags.ARCHIVE_FORMAT, "none"])
+
+            # Note: Don't pass op_vault - backup uses password file, not 1Password at runtime
+
+            logger.debug(f"TUI: Running command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30 min timeout
+
+            if result.returncode == 0:
+                logger.info(f"TUI: Backup completed successfully for job '{name}'")
+            else:
+                logger.error(f"TUI: Backup failed for job '{name}': {result.stderr}")
+
+            # Use call_from_thread to safely update UI from worker thread
+            self.call_from_thread(self._on_backup_complete, result.returncode == 0, name, result.stderr)
+        except subprocess.TimeoutExpired:
+            logger.error(f"TUI: Backup timed out for job '{name}' (30 min limit)")
+            self.call_from_thread(self._on_backup_complete, False, name, "Backup timed out after 30 minutes")
+        except Exception as e:
+            error_msg = str(e)
+            full_traceback = traceback.format_exc()
+            logger.error(f"TUI: Exception running backup for job '{name}': {error_msg}\n{full_traceback}")
+            self.call_from_thread(self._on_backup_complete, False, name, error_msg)
+
+    def _on_backup_complete(self, success: bool, name: str, error: str) -> None:
+        """Handle backup completion (called from main thread)."""
+        self._running_backups.discard(name)
+        if success:
+            self.notify(f"Backup completed for {name}")
+        else:
+            # Show brief error in UI, full error is in logs
+            self.notify(f"Backup failed for {name}. See logs/snapback.log", severity="error")
+            logger.error(f"TUI: Backup failed for {name}: {error}")
+        self.refresh_jobs()
+
+    def action_view_plist(self) -> None:
+        """View the daemon plist for the selected job."""
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        source = job.get("source", "")
+        name = job.get("name", "")
+        key = get_job_key(Path(source)) if source else ""
+
+        # Check if daemon is installed
+        state = load_state()
+        job_state = state.get(key, {})
+        plist_path = job_state.get("daemon_plist", "")
+
+        if not plist_path or not Path(plist_path).exists():
+            self.notify(f"No daemon installed for '{name}'", severity="warning")
+            return
+
+        # Read and display the plist
+        try:
+            content = Path(plist_path).read_text()
+            self.push_screen(PlistModal(f"Daemon: {name}", content))
+        except Exception as e:
+            self.notify(f"Error reading plist: {e}", severity="error")
+
+    def action_view_history(self) -> None:
+        """View backup history for the selected job."""
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        resolved = resolve_job_config(job, defaults)
+
+        name = resolved.get("name", "")
+        source = Path(resolved.get("source", "")).expanduser()
+        dest = Path(resolved.get("dest", "")).expanduser()
+
+        self.push_screen(HistoryModal(name, dest, source))
+
+    def action_edit_defaults(self) -> None:
+        manifest = load_manifest()
+        defaults = manifest.get("defaults", {})
+        self.push_screen(EditDefaultsModal(defaults), self._on_defaults_edited)
+
+    def _on_defaults_edited(self, result: dict | None) -> None:
+        if result is None:
+            logger.debug("TUI: Defaults edit cancelled")
+            return
+
+        logger.info(f"TUI: Updated defaults: {result}")
+        manifest = load_manifest()
+        manifest["defaults"] = result
+        save_manifest(manifest)
+        self.refresh_jobs()
+        self.notify("Defaults saved")
 
 
 @cli.group()
@@ -1700,21 +3005,23 @@ def daemon():
 
 
 @daemon.command("install")
-@click.option("--source", "-s", type=click.Path(exists=True, path_type=Path), required=True,
+@click.option(CLIFlags.SOURCE, "-s", type=click.Path(exists=True, path_type=Path), required=True,
               help="Source directory to backup")
-@click.option("--dest", "-d", type=click.Path(path_type=Path), required=True,
+@click.option(CLIFlags.DEST, "-d", type=click.Path(path_type=Path), required=True,
               help="Destination directory for backups")
-@click.option("--name", "-N", required=True, help="Name for this backup")
-@click.option("--mode", "-m", type=click.Choice(["hybrid", "restic", "7z"]), default=None,
-              help="Backup mode: hybrid (restic + 7z), restic only, or 7z only (prompts if not specified)")
-@click.option("--restic-interval", type=int, default=DEFAULT_RESTIC_INTERVAL_HOURS,
+@click.option(CLIFlags.NAME, "-N", required=True, help="Name for this backup")
+@click.option(CLIFlags.RESTIC + "/" + CLIFlags.NO_RESTIC, default=None,
+              help="Enable/disable restic incremental backup")
+@click.option(CLIFlags.ARCHIVE_FORMAT, type=click.Choice(["7z", "tar.gz", "none"]), default=None,
+              help="Archive format for full backups (7z, tar.gz, or none)")
+@click.option(CLIFlags.RESTIC_INTERVAL, type=int, default=DEFAULT_RESTIC_INTERVAL_HOURS,
               help=f"Hours between restic backups (default: {DEFAULT_RESTIC_INTERVAL_HOURS})")
-@click.option("--full-interval", type=int, default=DEFAULT_FULL_INTERVAL_DAYS,
-              help=f"Days between full 7z backups (default: {DEFAULT_FULL_INTERVAL_DAYS})")
+@click.option(CLIFlags.FULL_INTERVAL, type=int, default=DEFAULT_FULL_INTERVAL_DAYS,
+              help=f"Days between full archive backups (default: {DEFAULT_FULL_INTERVAL_DAYS})")
 @click.option("--1password", "use_1password", is_flag=True,
               help="Backup restic password to 1Password at install time (daemon uses local password file)")
-@click.option("--1password-vault", "op_vault", type=str, help="1Password vault name (prompts if not specified)")
-def daemon_install(source, dest, name, mode, restic_interval, full_interval, use_1password, op_vault):
+@click.option(CLIFlags.ONEPASSWORD_VAULT, "op_vault", type=str, help="1Password vault name (prompts if not specified)")
+def daemon_install(source, dest, name, restic, archive_format, restic_interval, full_interval, use_1password, op_vault):
     """Install and start the backup daemon."""
     setup_logging()
 
@@ -1730,38 +3037,69 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
     # Check for existing job config (for re-installs)
     existing_job = load_job_config(source)
     existing_vault = existing_job.get("options", {}).get("op_vault") if existing_job else None
-    existing_mode = existing_job.get("options", {}).get("mode") if existing_job else None
+    existing_opts = existing_job.get("options", {}) if existing_job else {}
+    existing_use_restic = existing_opts.get("use_restic")
+    existing_archive = existing_opts.get("archive_format")
 
-    # Handle mode selection
-    if mode is None:
+    # Handle restic/archive selection
+    use_restic = restic
+    if use_restic is None and archive_format is None:
         if sys.stdout.isatty():
             import questionary
 
-            # Check if we have an existing mode to suggest
-            if existing_mode:
+            # Check if we have an existing config to suggest
+            if existing_use_restic is not None or existing_archive is not None:
+                existing_desc = []
+                if existing_use_restic:
+                    existing_desc.append("restic")
+                if existing_archive:
+                    existing_desc.append(existing_archive)
+                existing_mode_str = " + ".join(existing_desc) if existing_desc else "7z"
+
                 if questionary.confirm(
-                    f"Use previously configured mode '{existing_mode}'?",
+                    f"Use previously configured mode ({existing_mode_str})?",
                     default=True
                 ).ask():
-                    mode = existing_mode
-                    logger.info(f"Using existing mode: {mode}")
+                    use_restic = existing_use_restic or False
+                    archive_format = existing_archive or ArchiveFormat.SEVENZ.value
+                    logger.info(f"Using existing config: restic={use_restic}, archive={archive_format}")
 
-            if mode is None:
+            if use_restic is None:
                 mode = questionary.select(
                     "Select backup mode:",
                     choices=[
-                        questionary.Choice("hybrid - restic incremental + weekly 7z full backup (recommended)", value="hybrid"),
-                        questionary.Choice("restic - incremental backups only (space efficient)", value="restic"),
-                        questionary.Choice("7z - compressed archives only (easy to restore)", value="7z"),
+                        questionary.Choice("restic + 7z - incremental + weekly archive (recommended)", value="restic_7z"),
+                        questionary.Choice("restic only - incremental backups only (space efficient)", value="restic"),
+                        questionary.Choice("7z only - compressed archives only (easy to restore)", value="7z"),
                     ],
                     instruction="(↑↓ to move, Enter to select)",
                 ).ask()
 
                 if mode is None:
                     raise click.ClickException("Mode selection cancelled")
+
+                # Map selection to new schema
+                if mode == "restic_7z":
+                    use_restic = True
+                    archive_format = ArchiveFormat.SEVENZ.value
+                elif mode == "restic":
+                    use_restic = True
+                    archive_format = ArchiveFormat.NONE.value
+                else:  # 7z
+                    use_restic = False
+                    archive_format = ArchiveFormat.SEVENZ.value
         else:
-            # Non-interactive: default to hybrid
-            mode = "hybrid"
+            # Non-interactive: default to restic + 7z
+            use_restic = True
+            archive_format = ArchiveFormat.SEVENZ.value
+
+    # Apply defaults if still None
+    if use_restic is None:
+        use_restic = True
+    if archive_format is None:
+        archive_format = ArchiveFormat.SEVENZ.value
+    if archive_format == "none":
+        archive_format = ArchiveFormat.NONE.value
 
     # Handle 1Password backup of restic password
     selected_vault = None
@@ -1809,20 +3147,18 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
     # Run hourly - the backup logic will skip if not needed based on restic_interval/full_interval
     interval_seconds = 3600
 
-    # Build mode args for plist
-    if mode == "hybrid":
-        mode_args = """
-        <string>--hybrid</string>
-        <string>--restic-interval</string>
-        <string>{restic_interval}</string>
-        <string>--full-interval</string>
-        <string>{full_interval}</string>""".format(restic_interval=restic_interval, full_interval=full_interval)
-    elif mode == "restic":
-        mode_args = """
-        <string>--restic</string>"""
-    else:  # 7z
-        mode_args = """
-        <string>--7z</string>"""
+    # Build mode args for plist using new schema
+    mode_args_list = []
+    if use_restic:
+        mode_args_list.append(f"        <string>{CLIFlags.RESTIC}</string>")
+        mode_args_list.append(f"        <string>{CLIFlags.RESTIC_INTERVAL}</string>")
+        mode_args_list.append(f"        <string>{restic_interval}</string>")
+    if archive_format and archive_format != ArchiveFormat.NONE.value:
+        mode_args_list.append(f"        <string>{CLIFlags.ARCHIVE_FORMAT}</string>")
+        mode_args_list.append(f"        <string>{archive_format}</string>")
+        mode_args_list.append(f"        <string>{CLIFlags.FULL_INTERVAL}</string>")
+        mode_args_list.append(f"        <string>{full_interval}</string>")
+    mode_args = "\n" + "\n".join(mode_args_list) if mode_args_list else ""
 
     # Generate plist content (no 1password flags - daemon uses password file)
     plist_content = PLIST_TEMPLATE.format(
@@ -1851,12 +3187,12 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
 
     logger.success(f"Daemon '{name}' installed and running")
     logger.info("  Checks: every hour (and on login/wake)")
-    if mode == "hybrid":
-        logger.info(f"  Mode: hybrid (restic if >{restic_interval}h old, 7z if >{full_interval}d old)")
-    elif mode == "restic":
-        logger.info(f"  Mode: restic (if >{restic_interval}h since last backup)")
+    if use_restic and archive_format:
+        logger.info(f"  Mode: restic + {archive_format} (restic if >{restic_interval}h old, {archive_format} if >{full_interval}d old)")
+    elif use_restic:
+        logger.info(f"  Mode: restic only (if >{restic_interval}h since last backup)")
     else:
-        logger.info(f"  Mode: 7z (if >{restic_interval}h since last backup)")
+        logger.info(f"  Mode: {archive_format} only (if >{full_interval}d since last backup)")
     logger.info(f"  Logs: {log_path}")
     logger.info(f"  Plist: {plist_path}")
 
@@ -1887,7 +3223,8 @@ def daemon_install(source, dest, name, mode, restic_interval, full_interval, use
     # Save job config with 1Password info
     save_job_config(
         source, dest, name,
-        mode=mode,
+        use_restic=use_restic,
+        archive_format=archive_format,
         restic_interval=restic_interval,
         full_interval=full_interval,
         op_vault=selected_vault,
@@ -1987,24 +3324,23 @@ def generate_plist_content(job_name: str, job: dict) -> str:
     opts = job.get("options", {})
     source_key = job.get("source", "")
 
-    # Build mode args
-    mode = opts.get("mode", "hybrid")
+    # Build mode args using new schema
+    use_restic = opts.get("use_restic", True)
+    archive_format = opts.get("archive_format", ArchiveFormat.SEVENZ.value)
     restic_interval = opts.get("restic_interval", DEFAULT_RESTIC_INTERVAL_HOURS)
     full_interval = opts.get("full_interval", DEFAULT_FULL_INTERVAL_DAYS)
 
-    if mode == "hybrid":
-        mode_args = f"""
-        <string>--hybrid</string>
-        <string>--restic-interval</string>
-        <string>{restic_interval}</string>
-        <string>--full-interval</string>
-        <string>{full_interval}</string>"""
-    elif mode == "restic":
-        mode_args = """
-        <string>--restic</string>"""
-    else:
-        mode_args = """
-        <string>--7z</string>"""
+    mode_args_list = []
+    if use_restic:
+        mode_args_list.append(f"        <string>{CLIFlags.RESTIC}</string>")
+        mode_args_list.append(f"        <string>{CLIFlags.RESTIC_INTERVAL}</string>")
+        mode_args_list.append(f"        <string>{restic_interval}</string>")
+    if archive_format and archive_format != ArchiveFormat.NONE.value:
+        mode_args_list.append(f"        <string>{CLIFlags.ARCHIVE_FORMAT}</string>")
+        mode_args_list.append(f"        <string>{archive_format}</string>")
+        mode_args_list.append(f"        <string>{CLIFlags.FULL_INTERVAL}</string>")
+        mode_args_list.append(f"        <string>{full_interval}</string>")
+    mode_args = "\n" + "\n".join(mode_args_list) if mode_args_list else ""
 
     return PLIST_TEMPLATE.format(
         version=__version__,
@@ -2239,6 +3575,102 @@ def daemon_plist(name, raw):
 # Jobs Management
 # =============================================================================
 
+@cli.command("config")
+def show_config():
+    """Show current configuration with rich formatting."""
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+
+    manifest = load_manifest()
+    state = load_state()
+    defaults = manifest.get("defaults", {})
+
+    # Defaults panel
+    defaults_text = Text()
+    defaults_text.append("Destination: ", style="bold")
+    defaults_text.append(f"{defaults.get('dest', '~/Backups')}\n")
+
+    archive_fmt = defaults.get("archive_format", "7z")
+    use_restic = defaults.get("use_restic", False)
+    defaults_text.append("Archive Format: ", style="bold")
+    defaults_text.append(f"{archive_fmt or 'none'}\n")
+    defaults_text.append("Restic: ", style="bold")
+    defaults_text.append(f"{'enabled' if use_restic else 'disabled'}\n")
+
+    defaults_text.append("Full Backup Interval: ", style="bold")
+    defaults_text.append(f"{defaults.get('full_interval_days', 7)} days\n")
+    defaults_text.append("Restic Interval: ", style="bold")
+    defaults_text.append(f"{defaults.get('restic_interval_hours', 4)} hours\n")
+
+    op_vault = defaults.get("op_vault", "")
+    if op_vault:
+        defaults_text.append("1Password Vault: ", style="bold")
+        defaults_text.append(f"{op_vault}\n")
+
+    console.print(Panel(defaults_text, title="[bold]Defaults[/bold]", border_style="blue"))
+
+    # Jobs table
+    table = Table(title="Jobs", show_header=True, header_style="bold")
+    table.add_column("Name", style="cyan")
+    table.add_column("Source")
+    table.add_column("Dest")
+    table.add_column("Format")
+    table.add_column("Daemon")
+    table.add_column("Last Run")
+
+    for job in manifest.get("jobs", []):
+        resolved = resolve_job_config(job, defaults)
+        source = job.get("source", "")
+        key = get_job_key(Path(source)) if source else ""
+        job_state = state.get(key, {})
+
+        # Format display
+        archive_fmt = resolved.get("archive_format", "")
+        use_restic = resolved.get("use_restic", False)
+        if archive_fmt and use_restic:
+            format_display = f"{archive_fmt}+restic"
+        elif archive_fmt:
+            format_display = archive_fmt
+        elif use_restic:
+            format_display = "restic"
+        else:
+            format_display = "none"
+
+        # Daemon status
+        daemon_plist = job_state.get("daemon_plist", "")
+        daemon_status = "[green]●[/green]" if daemon_plist and Path(daemon_plist).exists() else "[dim]○[/dim]"
+
+        # Last run
+        last_runs = job_state.get("last_runs", {})
+        last_run = "[dim]never[/dim]"
+        if last_runs:
+            latest = max(last_runs.values())
+            try:
+                dt = datetime.fromisoformat(latest)
+                delta = datetime.now() - dt
+                if delta.days > 0:
+                    last_run = f"{delta.days}d ago"
+                elif delta.seconds >= 3600:
+                    last_run = f"{delta.seconds // 3600}h ago"
+                else:
+                    last_run = f"{delta.seconds // 60}m ago"
+            except ValueError:
+                last_run = latest
+
+        table.add_row(
+            resolved.get("name", ""),
+            source,
+            resolved.get("dest", ""),
+            format_display,
+            daemon_status,
+            last_run,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Config file: {MANIFEST_FILE}[/dim]")
+
+
 @cli.command("jobs")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed info for each job")
 def list_jobs(verbose):
@@ -2266,19 +3698,20 @@ def list_jobs(verbose):
         dest = job.get("dest", "?")
         opts = job.get("options", {})
 
-        # Build mode string
+        # Build mode string using new schema
         mode_parts = []
-        if opts.get("hybrid"):
-            mode_parts.append("hybrid")
-        elif opts.get("restic"):
+        use_restic = opts.get("use_restic", False)
+        archive_format = opts.get("archive_format", ArchiveFormat.SEVENZ.value)
+
+        if use_restic:
             mode_parts.append("restic")
-        else:
-            mode_parts.append("7z" if opts.get("use_7z", True) else "tar.gz")
+        if archive_format and archive_format != ArchiveFormat.NONE.value:
+            mode_parts.append(archive_format)
 
         if opts.get("split_size") and not opts.get("no_split"):
             mode_parts.append(f"split:{opts['split_size']}")
 
-        mode_str = " + ".join(mode_parts)
+        mode_str = " + ".join(mode_parts) if mode_parts else "none"
 
         logger.info(f"  {name}")
         logger.info(f"    Source: {source_key}")
@@ -2412,21 +3845,22 @@ def list_all_jobs(as_json):
         opts = job.get("options", {})
         last_runs = job.get("last_runs", {})
 
-        # Mode
-        mode = opts.get("mode", "")
-        if not mode:
-            if opts.get("hybrid"):
-                mode = "hybrid"
-            elif opts.get("restic"):
-                mode = "restic"
-            else:
-                mode = "7z" if opts.get("use_7z", True) else "tar.gz"
+        # Mode - use new schema
+        use_restic = opts.get("use_restic", False)
+        archive_format = opts.get("archive_format", ArchiveFormat.SEVENZ.value)
+
+        mode_parts = []
+        if use_restic:
+            mode_parts.append("restic")
+        if archive_format and archive_format != ArchiveFormat.NONE.value:
+            mode_parts.append(archive_format)
+        mode = " + ".join(mode_parts) if mode_parts else "none"
 
         # Last runs - check jobs.json first, then fall back to checking actual files
         dest = job.get("dest", "")
 
-        last_restic_str = last_runs.get("restic") or last_runs.get("hybrid")
-        last_full_str = last_runs.get("7z") or last_runs.get("tar.gz") or last_runs.get("hybrid")
+        last_restic_str = last_runs.get("restic")
+        last_full_str = last_runs.get("7z") or last_runs.get("tar.gz")
 
         # Fall back to checking actual backup files if not in jobs.json
         last_restic_dt = None
@@ -2514,6 +3948,144 @@ def list_all_jobs(as_json):
 
     console.print(table)
     console.print(f"\n[dim]Config: {JOBS_FILE}[/dim]")
+
+
+@cli.command("check-passwords")
+@click.option("--1password", "check_1password", is_flag=True, help="Compare local passwords with 1Password")
+def check_passwords(check_1password: bool):
+    """Verify restic password files work with their repositories."""
+    from rich.table import Table
+
+    manifest = load_manifest()
+    defaults = manifest.get("defaults", {})
+    jobs = manifest.get("jobs", [])
+
+    if not jobs:
+        logger.info("No jobs configured.")
+        return
+
+    # Check 1Password CLI if needed
+    if check_1password and not check_1password_cli():
+        logger.error("1Password CLI not available. Install and authenticate first.")
+        return
+
+    console.print("\n[bold]Checking restic passwords...[/bold]\n")
+
+    results = []
+    for job in jobs:
+        resolved = resolve_job_config(job, defaults)
+        name = resolved.get("name", "unknown")
+        source = Path(resolved.get("source", "")).expanduser()
+        dest = Path(resolved.get("dest", "")).expanduser()
+        use_restic = resolved.get("use_restic", False)
+        op_vault = resolved.get("op_vault", "")
+
+        if not use_restic:
+            results.append((name, "skip", "restic not enabled", None))
+            continue
+
+        # Check password file
+        password_file = Path.home() / ".config/restic" / f"{name}-password"
+        if not password_file.exists():
+            results.append((name, "missing", "no password file", None))
+            continue
+
+        local_password = password_file.read_text().strip()
+
+        # Check restic repo
+        restic_repo = dest / name / "restic"
+        if not (restic_repo / "config").exists():
+            results.append((name, "no-repo", "restic repo not initialized", None))
+            continue
+
+        # Try to access repo with password
+        cmd = [
+            "restic", "-r", str(restic_repo),
+            "--password-file", str(password_file),
+            "cat", "config"
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                repo_status = "ok"
+                repo_details = "password valid"
+            else:
+                if "wrong password" in result.stderr.lower():
+                    repo_status = "wrong"
+                    repo_details = "wrong password"
+                else:
+                    repo_status = "error"
+                    repo_details = result.stderr.strip()[:50]
+        except subprocess.TimeoutExpired:
+            repo_status = "timeout"
+            repo_details = "restic timed out"
+        except Exception as e:
+            repo_status = "error"
+            repo_details = str(e)[:50]
+
+        # Check 1Password if requested
+        op_status = None
+        if check_1password and op_vault:
+            op_password = get_password_from_1password(name, op_vault)
+            if op_password is None:
+                op_status = "not-found"
+            elif op_password == local_password:
+                op_status = "match"
+            else:
+                op_status = "mismatch"
+        elif check_1password and not op_vault:
+            op_status = "no-vault"
+
+        results.append((name, repo_status, repo_details, op_status))
+
+    # Display results
+    table = Table(title="Restic Password Check")
+    table.add_column("Job", style="cyan")
+    table.add_column("Repo")
+    table.add_column("Details", style="dim")
+    if check_1password:
+        table.add_column("1Password")
+
+    for name, status, details, op_status in results:
+        if status == "ok":
+            status_display = "[green]✓ OK[/green]"
+        elif status == "skip":
+            status_display = "[dim]- skip[/dim]"
+        elif status == "wrong":
+            status_display = "[red]✗ WRONG[/red]"
+        elif status == "missing":
+            status_display = "[yellow]! missing[/yellow]"
+        elif status == "no-repo":
+            status_display = "[yellow]! no repo[/yellow]"
+        else:
+            status_display = f"[red]✗ {status}[/red]"
+
+        if check_1password:
+            if op_status == "match":
+                op_display = "[green]✓ synced[/green]"
+            elif op_status == "mismatch":
+                op_display = "[red]✗ differs[/red]"
+            elif op_status == "not-found":
+                op_display = "[yellow]! not in 1P[/yellow]"
+            elif op_status == "no-vault":
+                op_display = "[dim]no vault[/dim]"
+            else:
+                op_display = "[dim]-[/dim]"
+            table.add_row(name, status_display, details, op_display)
+        else:
+            table.add_row(name, status_display, details)
+
+    console.print(table)
+
+
+@cli.command()
+def configure():
+    """Launch interactive configuration editor."""
+    setup_logging(file_logging=True, console=False)  # No console output in TUI
+    logger.info("Starting TUI configuration editor")
+    app = SnapbackApp()
+    app.run()
+    logger.info("TUI configuration editor closed")
 
 
 def main() -> int:
