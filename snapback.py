@@ -85,19 +85,86 @@ def is_on_battery() -> bool:
 
 
 def load_jobs() -> dict:
-    """Load saved job configurations."""
-    if not JOBS_FILE.exists():
-        return {}
-    try:
-        return json.loads(JOBS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+    """Load saved job configurations (from manifest, keyed by resolved source path)."""
+    # Try migration first
+    migrate_jobs_json()
+
+    manifest = load_manifest()
+    state = load_state()
+    defaults = manifest.get("defaults", {})
+    jobs = {}
+
+    for job in manifest.get("jobs", []):
+        source = job.get("source", "")
+        if not source:
+            continue
+        key = get_job_key(Path(source))
+        resolved = resolve_job_config(job, defaults)
+
+        # Merge in state data for backward compatibility
+        job_state = state.get(key, {})
+
+        jobs[key] = {
+            "source": source,
+            "dest": resolved.get("dest", ""),
+            "name": resolved.get("name", ""),
+            "options": {
+                "use_7z": resolved.get("format") == "7z",
+                "use_restic": resolved.get("format") == "restic",
+                "hybrid": resolved.get("format") == "hybrid",
+                "op_vault": resolved.get("op_vault"),
+                "restic_interval_hours": resolved.get("restic_interval_hours"),
+                "full_interval_days": resolved.get("full_interval_days"),
+                "daemon_plist": job_state.get("daemon_plist"),
+            },
+            "last_runs": job_state.get("last_runs", {}),
+        }
+
+    return jobs
 
 
 def save_jobs(jobs: dict) -> None:
-    """Save job configurations."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    JOBS_FILE.write_text(json.dumps(jobs, indent=2, default=str))
+    """Save job configurations to manifest."""
+    manifest = load_manifest()
+    state = load_state()
+
+    new_jobs = []
+    for key, job_data in jobs.items():
+        job_config = {
+            "name": job_data.get("name", ""),
+            "source": job_data.get("source", ""),
+        }
+
+        dest = job_data.get("dest", "")
+        if dest and dest != manifest.get("defaults", {}).get("dest"):
+            job_config["dest"] = dest
+
+        opts = job_data.get("options", {})
+        if opts.get("hybrid"):
+            job_config["format"] = "hybrid"
+        elif opts.get("use_restic"):
+            job_config["format"] = "restic"
+        elif not opts.get("use_7z", True):
+            job_config["format"] = "tar.gz"
+        # else: inherits default
+
+        if opts.get("op_vault"):
+            job_config["op_vault"] = opts["op_vault"]
+
+        new_jobs.append(job_config)
+
+        # Update state
+        job_state = state.get(key, {})
+        if job_data.get("last_runs"):
+            job_state["last_runs"] = job_data["last_runs"]
+        if opts.get("daemon_plist"):
+            job_state["daemon_plist"] = opts["daemon_plist"]
+        if job_state:
+            state[key] = job_state
+
+    manifest["jobs"] = new_jobs
+    save_manifest(manifest)
+    save_state(state)
 
 
 def get_job_key(source: Path) -> str:
@@ -275,13 +342,14 @@ def load_job_config(source: Path) -> dict | None:
 
 def update_job_last_run(source: Path, backup_type: str) -> None:
     """Update the last run timestamp for a job."""
-    jobs = load_jobs()
+    state = load_state()
     key = get_job_key(source)
-    if key in jobs:
-        if "last_runs" not in jobs[key]:
-            jobs[key]["last_runs"] = {}
-        jobs[key]["last_runs"][backup_type] = datetime.now().isoformat()
-        save_jobs(jobs)
+    if key not in state:
+        state[key] = {}
+    if "last_runs" not in state[key]:
+        state[key]["last_runs"] = {}
+    state[key]["last_runs"][backup_type] = datetime.now().isoformat()
+    save_state(state)
 
 
 # Default directories to exclude
