@@ -2311,7 +2311,58 @@ class SnapbackApp(App):
         self.refresh_jobs()
 
     def action_run_now(self) -> None:
-        self.notify("Run now (not implemented yet)")
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            self.notify("No job selected", severity="warning")
+            return
+
+        manifest = load_manifest()
+        jobs = manifest.get("jobs", [])
+        if table.cursor_row >= len(jobs):
+            return
+
+        job = jobs[table.cursor_row]
+        defaults = manifest.get("defaults", {})
+        resolved = resolve_job_config(job, defaults)
+
+        name = resolved.get("name", "")
+        self.notify(f"Running backup for {name}...")
+        self.call_later(lambda: self._do_run_backup(resolved))
+
+    def _do_run_backup(self, job: dict) -> None:
+        """Run backup in background."""
+        import subprocess
+
+        source = job.get("source", "")
+        dest = job.get("dest", "")
+        name = job.get("name", "")
+        fmt = job.get("format", "7z")
+
+        cmd = [
+            sys.executable, __file__,
+            "--source", source,
+            "--dest", dest,
+            "--name", name,
+        ]
+
+        if fmt == "restic":
+            cmd.append("--restic")
+        elif fmt == "hybrid":
+            cmd.append("--hybrid")
+        elif fmt == "tar.gz":
+            cmd.extend(["--format", "tar.gz"])
+
+        if job.get("op_vault"):
+            cmd.extend(["--op-vault", job["op_vault"]])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            self.notify(f"Backup completed for {name}")
+        else:
+            self.notify(f"Backup failed: {result.stderr}", severity="error")
+
+        self.refresh_jobs()
 
     def action_edit_defaults(self) -> None:
         self.notify("Edit defaults (not implemented yet)")
