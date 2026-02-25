@@ -3376,7 +3376,7 @@ def daemon_update(yes):
     # Get launchctl status once
     launchctl_result = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
 
-    # Collect outdated daemons
+    # Collect outdated daemons (version mismatch OR content mismatch)
     outdated = []
     for source_key, job in jobs.items():
         job_name = job.get("name", "unnamed")
@@ -3384,13 +3384,19 @@ def daemon_update(yes):
         if not found_plist:
             continue
         plist_version = get_plist_version(found_plist)
-        if plist_version != __version__:
+        new_content = generate_plist_content(job_name, job)
+        old_content = found_plist.read_text()
+        version_outdated = plist_version != __version__
+        content_outdated = old_content != new_content
+        if version_outdated or content_outdated:
+            reason = "version" if version_outdated else "config"
             outdated.append({
                 "source_key": source_key,
                 "job": job,
                 "job_name": job_name,
                 "found_plist": found_plist,
                 "plist_version": plist_version,
+                "reason": reason,
             })
 
     if not outdated:
@@ -3403,7 +3409,9 @@ def daemon_update(yes):
     else:
         choices = [
             questionary.Choice(
-                title=f"{d['job_name']} ({d['plist_version'] or 'no version'} → {__version__})",
+                title=f"{d['job_name']} ({d['reason']}: {d['plist_version'] or 'no version'} → {__version__})"
+                    if d["reason"] == "version"
+                    else f"{d['job_name']} (config changed)",
                 value=d["job_name"],
                 checked=True,
             )
@@ -3448,7 +3456,11 @@ def daemon_update(yes):
 
         # Show header
         console.print(f"\n[bold cyan]{'─' * 60}[/bold cyan]")
-        console.print(f"[bold]{job_name}[/bold]: {plist_version or 'no version'} → {__version__}")
+        reason = daemon_info.get("reason", "version")
+        if reason == "version":
+            console.print(f"[bold]{job_name}[/bold]: {plist_version or 'no version'} → {__version__}")
+        else:
+            console.print(f"[bold]{job_name}[/bold]: config changed")
         if found_plist != new_plist_path:
             console.print(f"[dim]Path: {found_plist.name} → {new_plist_path.name}[/dim]")
 
