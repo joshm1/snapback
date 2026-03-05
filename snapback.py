@@ -16,6 +16,7 @@ For more info: https://github.com/joshm1/snapback
 """
 
 import json
+import shutil
 import tomllib
 from enum import Enum
 from typing import Literal, TypedDict
@@ -459,6 +460,31 @@ def update_job_last_run(source: Path, backup_type: str) -> None:
     save_state(state)
 
 
+def get_job_last_attempt(source: Path, backup_type: str) -> datetime | None:
+    """Get the last attempt timestamp for a job/backup type."""
+    state = load_state()
+    key = get_job_key(source)
+    timestamp = state.get(key, {}).get("last_attempts", {}).get(backup_type)
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+
+
+def update_job_last_attempt(source: Path, backup_type: str) -> None:
+    """Update the last attempt timestamp for a job."""
+    state = load_state()
+    key = get_job_key(source)
+    if key not in state:
+        state[key] = {}
+    if "last_attempts" not in state[key]:
+        state[key]["last_attempts"] = {}
+    state[key]["last_attempts"][backup_type] = datetime.now().isoformat()
+    save_state(state)
+
+
 # Default directories to exclude
 DEFAULT_EXCLUDES = [
     # JavaScript/Node
@@ -831,7 +857,11 @@ def ensure_restic_password() -> bool:
 def is_restic_repo_initialized() -> bool:
     """Check if restic repository is initialized."""
     assert _config is not None
-    return (_config.restic_repo / "config").exists()
+    try:
+        return (_config.restic_repo / "config").exists()
+    except OSError as e:
+        logger.warning(f"Could not read restic repository state: {e}")
+        return False
 
 
 def init_restic_repo() -> bool:
@@ -1480,28 +1510,23 @@ def get_password_from_1password(name: str, vault: str | None = None) -> str | No
 
 
 def create_7z_backup(dry_run: bool = False) -> Path | None:
-    """Create a 7z backup with optional volume splitting."""
+    """Create a 7z backup with optional volume splitting.
+
+    Compresses to a local temp directory first, then moves the result
+    to the final destination. This avoids slow I/O when the destination
+    is a cloud-synced filesystem (e.g. Google Drive).
+    """
     assert _config is not None
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     backup_name = f"{_config.backup_prefix}{timestamp}{_config.backup_suffix}"
-    backup_path = _config.backup_dir / _config.name / backup_name
+    final_dir = _config.backup_dir / _config.name
+    final_path = final_dir / backup_name
 
     # Build exclusion args for 7z
     exclude_args = []
     for d in _config.excludes_for_full:
         # 7z uses -xr! for recursive exclusion
         exclude_args.extend([f"-xr!{d}"])
-
-    # Build the command
-    cmd = ["7z", "a", "-mx=9"]  # Maximum compression
-
-    # Add volume splitting if specified
-    if _config.split_size:
-        cmd.append(f"-v{_config.split_size}")
-
-    cmd.append(str(backup_path))
-    cmd.extend(exclude_args)
-    cmd.append(str(_config.source_dir))
 
     if dry_run:
         logger.info(f"[DRY RUN] Would create 7z backup: {backup_name}")
@@ -1531,66 +1556,88 @@ def create_7z_backup(dry_run: bool = False) -> Path | None:
     logger.info(f"  Source: {_config.source_dir}")
     logger.debug(f"  Excluding: {', '.join(_config.excludes_for_full)}")
 
-    try:
-        # In interactive mode, let 7z show its native progress
-        if is_interactive():
-            result = subprocess.run(cmd, timeout=3600)  # 1 hour timeout for large backups
-        else:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    import tempfile
 
-        if result.returncode != 0:
-            error_msg = getattr(result, 'stderr', '') or "Unknown error"
-            logger.error(f"7z backup failed: {error_msg}")
+    with tempfile.TemporaryDirectory(prefix="snapback-7z-") as tmp_dir:
+        tmp_path = Path(tmp_dir) / backup_name
+
+        # Build the command targeting the local temp path
+        cmd = ["7z", "a", "-mx=9"]  # Maximum compression
+        if _config.split_size:
+            cmd.append(f"-v{_config.split_size}")
+        cmd.append(str(tmp_path))
+        cmd.extend(exclude_args)
+        cmd.append(str(_config.source_dir))
+
+        try:
+            # In interactive mode, let 7z show its native progress
+            if is_interactive():
+                result = subprocess.run(cmd, timeout=3600)
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+            if result.returncode != 0:
+                error_msg = getattr(result, 'stderr', '') or "Unknown error"
+                logger.error(f"7z backup failed: {error_msg}")
+                send_notification(
+                    f"Snapback: {_config.name} Failed",
+                    "7z backup error",
+                    sound=True,
+                )
+                return None
+
+            # Move files from temp to final destination
+            final_dir.mkdir(parents=True, exist_ok=True)
+
+            if _config.split_size:
+                # 7z creates: backup.7z.001, backup.7z.002, etc.
+                tmp_parts = sorted(Path(tmp_dir).glob(f"{backup_name}.*"))
+                if tmp_parts:
+                    total_size = sum(p.stat().st_size for p in tmp_parts)
+                    logger.info(f"Moving {len(tmp_parts)} volumes ({format_size(total_size)}) to destination...")
+                    for part in tmp_parts:
+                        shutil.move(str(part), str(final_dir / part.name))
+                    # Verify moved files
+                    parts = sorted(final_dir.glob(f"{backup_name}.*"))
+                    logger.success(f"7z backup created: {len(parts)} volumes ({format_size(total_size)} total)")
+                    for part in parts[:5]:
+                        logger.info(f"  {part.name} ({format_size(part.stat().st_size)})")
+                    if len(parts) > 5:
+                        logger.info(f"  ... and {len(parts) - 5} more volumes")
+                    send_notification(
+                        f"Snapback: {_config.name} Complete",
+                        f"Saved {len(parts)} volumes, {format_size(total_size)}",
+                        sound=False,
+                    )
+                    return parts[0]
+            else:
+                logger.info("Moving backup to destination...")
+                shutil.move(str(tmp_path), str(final_path))
+                size = final_path.stat().st_size
+                logger.success(f"7z backup created: {backup_name} ({format_size(size)})")
+                send_notification(
+                    f"Snapback: {_config.name} Complete",
+                    f"Saved {format_size(size)}",
+                    sound=False,
+                )
+                return final_path
+
+        except subprocess.TimeoutExpired:
+            logger.error("7z backup timed out after 1 hour")
             send_notification(
                 f"Snapback: {_config.name} Failed",
-                "7z backup error",
+                "Backup timed out after 1 hour",
                 sound=True,
             )
             return None
-
-        # Find all created files (could be split volumes)
-        if _config.split_size:
-            # 7z creates: backup.7z.001, backup.7z.002, etc.
-            parts = sorted(_config.backup_dir.glob(f"{backup_name}.*"))
-            if parts:
-                total_size = sum(p.stat().st_size for p in parts)
-                logger.success(f"7z backup created: {len(parts)} volumes ({format_size(total_size)} total)")
-                for part in parts[:5]:  # Show first 5
-                    logger.info(f"  {part.name} ({format_size(part.stat().st_size)})")
-                if len(parts) > 5:
-                    logger.info(f"  ... and {len(parts) - 5} more volumes")
-                send_notification(
-                    f"Snapback: {_config.name} Complete",
-                    f"Saved {len(parts)} volumes, {format_size(total_size)}",
-                    sound=False,
-                )
-                return parts[0]
-        else:
-            size = backup_path.stat().st_size
-            logger.success(f"7z backup created: {backup_name} ({format_size(size)})")
+        except Exception as e:
+            logger.error(f"7z backup failed: {e}")
             send_notification(
-                f"Snapback: {_config.name} Complete",
-                f"Saved {format_size(size)}",
-                sound=False,
+                f"Snapback: {_config.name} Failed",
+                f"Error: {e}",
+                sound=True,
             )
-            return backup_path
-
-    except subprocess.TimeoutExpired:
-        logger.error("7z backup timed out after 1 hour")
-        send_notification(
-            f"Snapback: {_config.name} Failed",
-            "Backup timed out after 1 hour",
-            sound=True,
-        )
-        return None
-    except Exception as e:
-        logger.error(f"7z backup failed: {e}")
-        send_notification(
-            f"Snapback: {_config.name} Failed",
-            f"Error: {e}",
-            sound=True,
-        )
-        return None
+            return None
 
     return None
 
@@ -1604,6 +1651,7 @@ def run_combined_backup(force: bool, auto: bool, dry_run: bool) -> int:
     assert _config is not None
     restic_ran = False
     full_ran = False
+    archive_fmt = _config.archive_format
 
     restic_threshold = timedelta(hours=_config.restic_interval_hours)
     full_threshold = timedelta(days=_config.full_interval_days)
@@ -1634,6 +1682,17 @@ def run_combined_backup(force: bool, auto: bool, dry_run: bool) -> int:
         full_needed = True
         logger.info("No previous full backup found.")
 
+    if full_needed and not force:
+        last_full_attempt = get_job_last_attempt(_config.source_dir, archive_fmt)
+        if last_full_attempt:
+            attempt_age = datetime.now() - last_full_attempt
+            if attempt_age < full_threshold:
+                full_needed = False
+                logger.info(
+                    f"Skipping full {archive_fmt}: last attempt was {format_age(attempt_age)} ago; "
+                    f"next retry in {format_age(full_threshold - attempt_age)}"
+                )
+
     if auto and not restic_needed and not full_needed:
         return 0
 
@@ -1653,11 +1712,11 @@ def run_combined_backup(force: bool, auto: bool, dry_run: bool) -> int:
                 logger.error("Restic backup failed")
 
     if full_needed:
-        archive_fmt = _config.archive_format
         if dry_run:
             logger.info(f"[DRY RUN] Would run full {archive_fmt} backup (every {_config.full_interval_days} days)")
         else:
             logger.info(f"Running full {archive_fmt} backup (every {_config.full_interval_days} days)...")
+            update_job_last_attempt(_config.source_dir, archive_fmt)
             if archive_fmt == ArchiveFormat.SEVENZ.value:
                 backup_result = create_7z_backup(dry_run=False)
             else:
